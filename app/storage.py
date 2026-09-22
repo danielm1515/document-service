@@ -29,8 +29,12 @@ class S3ObjectStore:
         if client is None:
             import boto3
             from botocore.config import Config
+            # total_max_attempts counts the first try too: at most 2 sends, so an upload's S3
+            # part is bounded by 2 x (5 s connect + 15 s read) = 40 s (README, "זמן תגובה מרבי").
+            # (botocore's max_attempts would count retries only - 2 of them, 3 sends in all.)
             client = boto3.client("s3", region_name=region,
-                                  config=Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 2}))
+                                  config=Config(connect_timeout=5, read_timeout=15,
+                                                retries={"total_max_attempts": 2, "mode": "standard"}))
         self._client = client
 
     def __repr__(self) -> str:
