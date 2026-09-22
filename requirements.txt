@@ -6,3 +6,4 @@ python-multipart==0.0.20
 pypdf==6.19.0
 boto3==1.43.99
 openai==3.17.0
+tzdata==2025.2

@@ -18,7 +18,14 @@ def test_the_catalog_is_the_designs_table():
 def test_health_says_what_is_configured(tmp_path):
     with TestClient(make(tmp_path, classifier=None, store=None)) as client:
         body = client.get("/health").json()
-    assert body == {"status": "ok", "database": "ok", "classifier": "not_configured", "storage": "not_configured"}
+    assert body == {"status": "ok", "database": "ok", "classifier": "not_configured", "storage": "not_configured",
+                    "auth": "not_configured"}
+
+
+def test_health_reports_auth_configured_when_a_key_is_set(tmp_path):
+    with TestClient(make(tmp_path, api_key="secret")) as client:
+        body = client.get("/health").json()
+    assert body["auth"] == "configured"
 
 
 def test_health_needs_no_key(tmp_path):

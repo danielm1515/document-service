@@ -1,12 +1,12 @@
 import asyncio
 import json
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -57,7 +57,10 @@ def test_an_accepted_document_is_stored_and_listed(tmp_path):
     [doc] = listing["documents"]
     assert {k: doc[k] for k in ("document_id", "document_type", "document_date", "result")} == {
         "document_id": body["document_id"], "document_type": "CBC", "document_date": "2026-09-15", "result": "ACCEPTED"}
+    assert doc["valid_until"] == "2026-12-14"  # 2026-09-15 + CBC's 90 days
     assert "uploaded_at" in doc
+    # set in Python (not a DB default), stored with microseconds, emitted with a UTC offset.
+    assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}[+-]\d{2}:\d{2}$", doc["uploaded_at"])
 
 
 @pytest.mark.parametrize("name, year, result", [
@@ -84,6 +87,52 @@ def test_the_same_accepted_file_again_is_a_duplicate_and_a_rejected_one_is_check
         # Another patient uploading the same file is not a duplicate of the first patient's.
         assert upload(client, "cbc", patient="P-20000").json()["result"] == "ACCEPTED"
     assert len(store.objects) == 2
+
+
+def test_a_duplicate_upload_reports_the_accepted_original(tmp_path):
+    # I4: the retry can be treated as the document already delivered.
+    app, store = make(tmp_path)
+    with TestClient(app) as client:
+        first = upload(client, "cbc").json()
+        assert "duplicate_of" not in first
+        second = upload(client, "cbc").json()
+    assert second["result"] == "DUPLICATE_DOCUMENT"
+    assert second["duplicate_of"] == first["document_id"]
+    assert second["document_type"] == "CBC" and second["document_date"] == "2026-09-15"
+    assert len(store.objects) == 1
+
+
+# --- I3: the listing reports validity as of app.state.today(), the stored row is never touched. ---
+
+def test_listing_reports_expiry_as_of_today_without_touching_the_stored_row(tmp_path):
+    box = {"value": date(2026, 9, 22)}
+    app = create_app(f"sqlite:///{(tmp_path / 'd.db').as_posix()}", api_key=KEY,
+                     classifier=FakeClassifier(), store=InMemoryObjectStore(), today=lambda: box["value"])
+    with TestClient(app) as client:
+        upload(client, "cbc")
+
+        def listed():
+            return client.get("/api/v1/patients/P-10041/documents", headers=H).json()["documents"][0]
+
+        assert listed()["result"] == "ACCEPTED" and listed()["valid_until"] == "2026-12-14"
+
+        box["value"] = date(2026, 12, 14)  # inclusive: valid_until == today is still ACCEPTED
+        assert listed()["result"] == "ACCEPTED"
+
+        box["value"] = date(2026, 12, 15)  # one day past valid_until
+        expired = listed()
+        assert expired["result"] == "DOCUMENT_EXPIRED" and expired["valid_until"] == "2026-12-14"
+
+    [row] = rows(app, Document)
+    assert row.result == "ACCEPTED"  # the stored row itself is never modified
+
+
+def test_valid_until_is_null_without_a_type_or_a_date(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        upload(client, "electricity_bill")
+        [doc] = client.get("/api/v1/patients/P-10041/documents", headers=H).json()["documents"]
+    assert doc["document_type"] is None and doc["valid_until"] is None
 
 
 def test_the_six_demo_files_give_the_designs_results(tmp_path):
@@ -195,6 +244,64 @@ def test_a_database_failure_after_storing_rolls_back_and_says_so(tmp_path, monke
     assert len(store.objects) == 1
 
 
+# --- I2: every route's session work is wrapped, so a DB failure anywhere in it becomes a plain
+# 503 and never leaks a patient_id through any logger, including sqlalchemy's own. ---
+
+def test_the_engine_hides_bind_parameters_on_error(tmp_path):
+    app, _ = make(tmp_path)
+    assert app.state.engine.hide_parameters is True
+
+
+def test_a_database_failure_at_the_duplicate_check_is_503_and_never_logged(tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    app, store = make(tmp_path)
+    with TestClient(app) as client:
+        with app.state.SessionLocal() as session:
+            session.execute(text("DROP TABLE documents"))
+            session.commit()
+        response = upload(client, "cbc")
+    assert response.status_code == 503 and response.json() == {"error": "database_unavailable"}
+    assert store.objects == {}
+    # Only this service's own logger and sqlalchemy's: httpx (the test client) logs the request
+    # URL itself, which legitimately carries the patient id in its path.
+    assert not any(r.name == "document-service" or r.name.startswith("sqlalchemy") for r in caplog.records)
+    logged = "\n".join(r.getMessage() for r in caplog.records
+                       if r.name == "document-service" or r.name.startswith("sqlalchemy"))
+    assert "P-10041" not in logged
+
+
+def test_a_database_failure_writing_the_storage_failure_audit_is_503(tmp_path, monkeypatch):
+    class Failing:
+        def put(self, key, data):
+            raise StorageFailed("AccessDenied")
+
+    def failing_commit(self):
+        raise SQLAlchemyError("boom")
+
+    app, _ = make(tmp_path, store=Failing())
+    monkeypatch.setattr(Session, "commit", failing_commit)
+    with TestClient(app) as client:
+        response = upload(client, "cbc")
+    assert response.status_code == 503 and response.json() == {"error": "database_unavailable"}
+
+
+def test_a_database_failure_at_listing_is_503_and_never_logged(tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        with app.state.SessionLocal() as session:
+            session.execute(text("DROP TABLE documents"))
+            session.commit()
+        response = client.get("/api/v1/patients/P-10041/documents", headers=H)
+    assert response.status_code == 503 and response.json() == {"error": "database_unavailable"}
+    assert not any(r.name == "document-service" or r.name.startswith("sqlalchemy") for r in caplog.records)
+    logged = "\n".join(r.getMessage() for r in caplog.records
+                       if r.name == "document-service" or r.name.startswith("sqlalchemy"))
+    assert "P-10041" not in logged
+
+
 # --- The auth-before-body ASGI middleware: raw ASGI calls, since FastAPI's own routing (and
 # TestClient's convenience layer) would already have parsed the body by the time a route runs. ---
 
@@ -225,9 +332,10 @@ def call_asgi(app, scope):
         sent.append(message)
 
     asyncio.run(app(scope, receive, send))
-    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    start = next(m for m in sent if m["type"] == "http.response.start")
     body = b"".join(m["body"] for m in sent if m["type"] == "http.response.body")
-    return status, body, calls["n"]
+    headers = {k.decode(): v.decode() for k, v in start["headers"]}
+    return start["status"], body, calls["n"], headers
 
 
 def test_an_unauthenticated_post_is_refused_before_the_body_is_read(tmp_path):
@@ -236,8 +344,9 @@ def test_an_unauthenticated_post_is_refused_before_the_body_is_read(tmp_path):
         scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
                            headers=[("content-length", "20000000"),
                                     ("content-type", "multipart/form-data; boundary=x")])
-        status, body, receive_calls = call_asgi(app, scope)
+        status, body, receive_calls, headers = call_asgi(app, scope)
     assert status == 401 and json.loads(body) == {"error": "unauthorized"}
+    assert headers.get("www-authenticate") == "ApiKey"
     assert receive_calls == 0
     assert rows(app, Document) == [] and rows(app, AuditLog) == []
     assert store.objects == {}
@@ -249,7 +358,7 @@ def test_a_post_over_the_cap_is_refused_without_reading_the_body(tmp_path):
         scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
                            headers=[("x-api-key", KEY), ("content-length", str(MAX_BODY_BYTES + 1)),
                                     ("content-type", "multipart/form-data; boundary=x")])
-        status, body, receive_calls = call_asgi(app, scope)
+        status, body, receive_calls, _headers = call_asgi(app, scope)
     assert status == 413 and json.loads(body) == {"error": "too_large"}
     assert receive_calls == 0
 
@@ -260,9 +369,9 @@ def test_a_post_at_the_cap_is_not_refused_for_size(tmp_path):
         scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
                            headers=[("x-api-key", KEY), ("content-length", str(MAX_BODY_BYTES)),
                                     ("content-type", "multipart/form-data; boundary=x")])
-        status, _body, receive_calls = call_asgi(app, scope)
+        status, _body, receive_calls, _headers = call_asgi(app, scope)
     # Passed on size; the route itself then reads an (empty, in this bare scope) body and refuses
-    # it as an incomplete multipart request - proof this went past the middleware.
+    # it as a malformed multipart request - proof this went past the middleware.
     assert status != 413 and receive_calls >= 1
 
 
@@ -271,7 +380,7 @@ def test_a_post_without_content_length_is_refused_without_reading_the_body(tmp_p
     with TestClient(app):
         scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
                            headers=[("x-api-key", KEY), ("content-type", "multipart/form-data; boundary=x")])
-        status, body, receive_calls = call_asgi(app, scope)
+        status, body, receive_calls, _headers = call_asgi(app, scope)
     assert status == 411 and json.loads(body) == {"error": "length_required"}
     assert receive_calls == 0
 
@@ -280,9 +389,51 @@ def test_get_and_health_are_unaffected_by_the_content_length_checks(tmp_path):
     app, _ = make(tmp_path)
     with TestClient(app):
         get_scope = http_scope("GET", "/api/v1/patients/P-10041/documents", headers=[("x-api-key", KEY)])
-        status, body, _ = call_asgi(app, get_scope)
+        status, body, _receive_calls, _headers = call_asgi(app, get_scope)
         assert status == 200 and json.loads(body) == {"documents": []}
 
         health_scope = http_scope("GET", "/health")  # no X-API-Key at all
-        status, body, _ = call_asgi(app, health_scope)
+        status, body, _receive_calls, _headers = call_asgi(app, health_scope)
         assert status == 200 and json.loads(body)["status"] == "ok"
+
+
+# --- Minor: every error shape is {"error": <snake_case code>}, including Starlette's own
+# HTTPException (404, 405) and a malformed multipart body (400). ---
+
+def test_an_unknown_route_is_a_json_not_found(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        response = client.get("/api/v1/nope", headers=H)
+    assert response.status_code == 404 and response.json() == {"error": "not_found"}
+
+
+def test_a_disallowed_method_is_a_json_method_not_allowed(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        response = client.delete("/api/v1/patients/P-10041/documents", headers=H)
+    assert response.status_code == 405 and response.json() == {"error": "method_not_allowed"}
+
+
+def test_a_malformed_multipart_body_is_a_json_bad_request(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/patients/P-10041/documents",
+            headers={**H, "content-type": "multipart/form-data; boundary=x"},
+            content=b"garbage, no boundary markers here")
+    assert response.status_code == 400 and response.json() == {"error": "bad_request"}
+
+
+# --- Minor: uploaded_at is set in Python, and ties in it are broken by insertion order (seq). ---
+
+def test_the_listing_breaks_a_tied_uploaded_at_by_insertion_order(tmp_path, monkeypatch):
+    import app.main as main
+    fixed = datetime(2026, 9, 22, 10, 0, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(main, "_utc_now", lambda: fixed)
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        first_id = upload(client, "cbc").json()["document_id"]
+        second_id = upload(client, "electricity_bill").json()["document_id"]
+        docs = client.get("/api/v1/patients/P-10041/documents", headers=H).json()["documents"]
+    assert [d["document_id"] for d in docs] == [first_id, second_id]
+    assert docs[0]["uploaded_at"] == docs[1]["uploaded_at"]

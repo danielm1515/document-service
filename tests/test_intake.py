@@ -5,7 +5,7 @@ import pytest
 
 from app.classifier import Classification, ClassifierFailed, FakeClassifier
 from app.intake import (ACCEPTED, DOCUMENT_EXPIRED, DOCUMENT_UNREADABLE, DUPLICATE_DOCUMENT, NON_MEDICAL_DOCUMENT,
-                        PATIENT_MISMATCH, run_intake)
+                        PATIENT_MISMATCH, DuplicateOf, run_intake)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TODAY = date(2026, 9, 22)
@@ -16,9 +16,10 @@ def data(year, name):
     return (FIXTURES / year / f"{name}.pdf").read_bytes()
 
 
-def intake(raw, *, classifier=None, today=TODAY, duplicates=(), patient="P-10041"):
+def intake(raw, *, classifier=None, today=TODAY, duplicates=None, patient="P-10041"):
+    duplicates = duplicates or {}
     return run_intake(raw, patient, classifier=classifier or FakeClassifier(), today=today,
-                      is_duplicate=lambda sha: sha in duplicates, max_bytes=MAX)
+                      is_duplicate=lambda sha: duplicates.get(sha), max_bytes=MAX)
 
 
 @pytest.mark.parametrize("name, doc_type", [("cbc", "CBC"), ("coagulation", "COAGULATION_TESTS"), ("ecg", "ECG"),
@@ -64,11 +65,27 @@ def test_a_pdf_with_no_text_is_unreadable():
 def test_an_accepted_duplicate_is_refused_before_classification():
     raw = data("2026", "cbc")
     first = intake(raw)
+    original = DuplicateOf("DOC-ORIGINAL1", "CBC", date(2026, 9, 15))
 
     class Boom:
         def classify(self, text):
             raise AssertionError("a duplicate must not reach the classifier")
-    assert intake(raw, classifier=Boom(), duplicates={first.sha256}).result == DUPLICATE_DOCUMENT
+    outcome = intake(raw, classifier=Boom(), duplicates={first.sha256: original})
+    assert outcome.result == DUPLICATE_DOCUMENT
+
+
+def test_a_duplicate_outcome_carries_the_original_document():
+    raw = data("2026", "cbc")
+    sha = intake(raw).sha256
+    original = DuplicateOf("DOC-ORIGINAL1", "CBC", date(2026, 9, 15))
+    outcome = intake(raw, duplicates={sha: original})
+    assert outcome.result == DUPLICATE_DOCUMENT
+    assert outcome.duplicate_of == "DOC-ORIGINAL1"
+    assert outcome.document_type == "CBC" and outcome.document_date == date(2026, 9, 15)
+
+
+def test_a_non_duplicate_outcome_has_no_duplicate_of():
+    assert intake(data("2026", "cbc")).duplicate_of is None
 
 
 class Scripted:
@@ -93,6 +110,21 @@ class Scripted:
 ])
 def test_each_classification_outcome(answer, result):
     assert intake(data("2026", "cbc"), classifier=Scripted(answer)).result == result
+
+
+# --- Minor: the identifier check is re.findall(r"P-\d+", identifier.upper()) - case-insensitive,
+# and matched anywhere in the string, not only when the whole field is the identifier. ---
+
+@pytest.mark.parametrize("identifier", ["p-20000", "מטופל: P-20000"])
+def test_patient_mismatch_is_found_case_insensitively_and_inside_surrounding_text(identifier):
+    answer = Classification(True, "CBC", date(2026, 9, 1), identifier)
+    assert intake(data("2026", "cbc"), classifier=Scripted(answer)).result == PATIENT_MISMATCH
+
+
+@pytest.mark.parametrize("identifier", ["p-10041", "מטופל: P-10041"])
+def test_the_patients_own_id_is_still_accepted_case_insensitively_and_inside_surrounding_text(identifier):
+    answer = Classification(True, "CBC", date(2026, 9, 1), identifier)
+    assert intake(data("2026", "cbc"), classifier=Scripted(answer)).result == ACCEPTED
 
 
 @pytest.mark.parametrize("doc_type, age_days, result", [
