@@ -17,11 +17,19 @@
 | `NON_MEDICAL_DOCUMENT` | הטקסט חולץ בהצלחה, אבל המסווג קבע שהמסמך אינו רפואי (חשבון, מכתב וכדומה). |
 | `DOCUMENT_UNREADABLE` | לא PDF תקין (לא מתחיל ב-`%PDF-`, גדול מ-10MB), אין בו שכבת טקסט (סריקה בלי OCR), חורג מ-20 עמודים או מ-200,000 תווי טקסט, קריאת המסווג נכשלה או לא החזירה תשובה שמישה, המסמך רפואי אך לא מסוג מוכר, או שתאריך ההפקה שלו עתידי. כל אלה כשל סגור - "לא קריא" ולא ניחוש. |
 | `DOCUMENT_EXPIRED` | אין תאריך הפקה במסמך (נחשב פג-תוקף - כשל סגור), או שהתאריך ישן יותר מתוקף הסוג (90 יום ל-CBC/קרישה/שתן, 180 ל-ECG, 30 לסיכום טרום-ניתוח). |
-| `DUPLICATE_DOCUMENT` | אותו קובץ בדיוק (גיבוב SHA-256 זהה) כבר התקבל בעבר (`ACCEPTED`) עבור אותו מטופל. קובץ שנדחה בעבר נבדק מחדש בהעלאה חוזרת - כשל סיווג חד-פעמי לא נועל אותו לצמיתות. |
-| `PATIENT_MISMATCH` | המסמך מציין מזהה מטופל אחר בתבנית ה-IdP (`P-<ספרות>`) שאינו המטופל שמעלה. מזהה שאינו בתבנית הזו (מספר מסמך, מספר לקוח וכו') מתעלמים ממנו. |
+| `DUPLICATE_DOCUMENT` | אותו קובץ בדיוק (גיבוב SHA-256 זהה) כבר התקבל בעבר (`ACCEPTED`) עבור אותו מטופל. קובץ שנדחה בעבר נבדק מחדש בהעלאה חוזרת - כשל סיווג חד-פעמי לא נועל אותו לצמיתות. התשובה כוללת `duplicate_of` (מזהה המסמך המקורי שהתקבל) ואת `document_type`/`document_date` שלו, כך שקורא שהבקשה הראשונה שלו נפלה ב-timeout יכול להתייחס לחזרה כאל המסמך שכבר נמסר. |
+| `PATIENT_MISMATCH` | המסמך מציין מזהה מטופל אחר בתבנית ה-IdP (`P-<ספרות>`) שאינו המטופל שמעלה - הבדיקה אינה תלוית-רישיות ומזהה גם כאשר הוא מוטמע בתוך טקסט (למשל "מטופל: P-20000"). מזהה שאינו בתבנית הזו (מספר מסמך, מספר לקוח וכו') מתעלמים ממנו. |
 
 רק מסמך `ACCEPTED` נשמר ב-S3, במפתח `patients/<patient_id>/<document_id>.pdf`; מסמך שנדחה
 נשמר רק כשורת מטא-דאטה (תוצאה, גיבוב, גודל) - לעולם לא התוכן עצמו.
+
+### תוקף כפונקציה של תאריך הבדיקה
+
+תוצאת ה-`ACCEPTED` שנקבעת בהעלאה נשמרת כמות שהיא בשורה - אבל הרשימה (`GET`) מדווחת תוקף **נכון
+לרגע הבדיקה** (`app.state.today()`), לא נכון לרגע ההעלאה: מסמך שהתקבל וחצה מאז את `valid_until`
+שלו (`document_date` + מספר הימים של הסוג בקטלוג) מוצג ברשימה כ-`DOCUMENT_EXPIRED`, אף ששורתו
+במסד עדיין `ACCEPTED`. `valid_until == today` עדיין נחשב בתוקף (כולל). כל שורה ברשימה נושאת גם
+שדה `valid_until` (`null` כשאין לה סוג מוכר או תאריך).
 
 ## הפעלה
 
@@ -42,7 +50,12 @@ docker compose ps
 
 בלי `OPENAI_API_KEY` או בלי `S3_BUCKET`, ה-health יחזיר `classifier`/`storage` בתור
 `not_configured`, והשירות עדיין עולה - אבל כל העלאה נענית ב-`503 {"error": "service_not_configured"}`
-עד שהם מוגדרים.
+עד שהם מוגדרים. ה-health חושף גם `auth` (`configured` / `not_configured`, לפי אם `DOCUMENT_API_KEY`
+הוגדר):
+
+```json
+{"status": "ok", "database": "ok", "classifier": "configured", "storage": "configured", "auth": "configured"}
+```
 
 ### מגבלות ההעלאה
 
@@ -57,6 +70,12 @@ docker compose ps
 - בקשת `POST` עם `Content-Length` שגדול מ-10MB + 64KB (תקורת multipart) -> `413 {"error": "too_large"}`.
 
 הניתוב עצמו בודק את הגודל גם בפועל (קורא לכל היותר גודל המגבלה + בית אחד), כהגנת עומק.
+
+### זמן תגובה מרבי להעלאה (I4)
+
+העלאה `ACCEPTED` עוברת קריאת מסווג (OpenAI, timeout 30 שניות) ואז כתיבה ל-S3 (חיבור 5 שניות +
+קריאה 15 שניות, עד 2 ניסיונות = 40 שניות לכל היותר). זמן התגובה המרבי התיאורטי הוא אפוא
+**30 + 40 = 70 שניות**; ה-timeout שה-Hospital Agent מגדיר לקריאה לשירות הזה חייב להיות גבוה מכך.
 
 ## הקמת S3 ו-IAM (פעם אחת, ב-AWS Console)
 
@@ -83,6 +102,10 @@ docker compose ps
    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],
      "Resource":"arn:aws:s3:::BUCKET/patients/*"}]}
    ```
+
+   `s3:GetObject` נשאר במדיניות גם שה-Hospital Agent אף פעם לא קורא PDF בעצמו (עיצוב §5.2):
+   קריאה חוזרת של קובץ, כשתידרש, תהיה presigned URL קצר-טווח (5 דקות) שהשירות עצמו מנפיק
+   (עיצוב §4.4) - וזה מחייב שלמשתמש ה-IAM שמנפיק אותו תהיה הרשאת `GetObject` על האובייקט.
 
 4. **המשתמש -> Security credentials -> Create access key**, use case: *Application running
    outside AWS*. את `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` ואת שם הדלי (`S3_BUCKET`)
@@ -115,6 +138,14 @@ curl -i -X POST \
 {"document_id": "DOC-3F2A1B9C0D4E", "document_type": "CBC", "document_date": "2026-09-15", "result": "ACCEPTED"}
 ```
 
+אם התוצאה `DUPLICATE_DOCUMENT`, התשובה כוללת גם `duplicate_of` - ו-`document_type`/`document_date`
+הם אלה של המסמך *המקורי* שהתקבל, לא של הקובץ הנוכחי (I4):
+
+```json
+{"document_id": "DOC-9B1C2D3E4F5A", "document_type": "CBC", "document_date": "2026-09-15",
+ "result": "DUPLICATE_DOCUMENT", "duplicate_of": "DOC-3F2A1B9C0D4E"}
+```
+
 **רשימת המסמכים של מטופל:**
 
 ```bash
@@ -125,11 +156,31 @@ curl -i -H "X-API-Key: <DOCUMENT_API_KEY>" http://localhost:8090/api/v1/patients
 
 ```json
 {"documents": [{"document_id": "DOC-3F2A1B9C0D4E", "document_type": "CBC", "document_date": "2026-09-15",
-                "result": "ACCEPTED", "uploaded_at": "2026-09-22T10:15:00+00:00"}]}
+                "result": "ACCEPTED", "valid_until": "2026-12-14", "uploaded_at": "2026-09-22T10:15:00.123456+00:00"}]}
 ```
 
 `document_type` ו-`document_date` הם `null` כשאין להם ערך ודאי (למשל `NON_MEDICAL_DOCUMENT`
-או `DOCUMENT_UNREADABLE` ללא תאריך). הרשימה ממוינת לפי זמן ההעלאה, כולל מסמכים שנדחו.
+או `DOCUMENT_UNREADABLE` ללא תאריך). `valid_until` (`document_date` + מספר הימים של הסוג בקטלוג)
+הוא `null` באותם מקרים; `result` מחושב נכון לרגע הבקשה, לא נכון לרגע ההעלאה (ראו "תוקף כפונקציה
+של תאריך הבדיקה" למעלה). הרשימה ממוינת לפי זמן ההעלאה (וכשהוא זהה - לפי סדר ההעלאה), כולל
+מסמכים שנדחו.
+
+### קודי שגיאה
+
+כל שגיאה היא `{"error": <קוד>}`:
+
+| סטטוס | קוד | מתי |
+|---|---|---|
+| 400 | `validation_error` | פרמטר לא תקין (למשל `patient_id` בתבנית שגויה, קובץ חסר). |
+| 400 | `bad_request` | גוף multipart פגום. |
+| 401 | `unauthorized` | `X-API-Key` חסר או שגוי (גם עם `WWW-Authenticate: ApiKey`). |
+| 404 | `not_found` | נתיב לא קיים. |
+| 405 | `method_not_allowed` | שיטת HTTP לא נתמכת בנתיב קיים. |
+| 411 | `length_required` | בקשת `POST` בלי `Content-Length`. |
+| 413 | `too_large` | `Content-Length` גדול מהמותר. |
+| 503 | `service_not_configured` | אין מסווג מוגדר (`OPENAI_API_KEY`) או אחסון מוגדר (`S3_BUCKET`). |
+| 503 | `storage_unavailable` | הכתיבה ל-S3 נכשלה. |
+| 503 | `database_unavailable` | פעולה במסד הנתונים נכשלה (I2) - לא נכתב דבר; אם כבר נכתב ל-S3, האובייקט נשאר שם יתום, לא מקושר לאף שורה ולכן לעולם לא מוגש. |
 
 ## קבצי הדמו
 
@@ -148,16 +199,30 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src \
 ```
 
 `tests/test_live.py` הן הבדיקות היחידות שפונות לרשת - קריאה אמיתית ל-OpenAI וכתיבה אמיתית
-לדלי - ולכן מדולגות כברירת מחדל. כדי להריץ אותן, מתוך שורש הפרויקט, ב-Git Bash, כשה-`.env`
-כבר מכיל `OPENAI_API_KEY` ו-`S3_BUCKET` אמיתיים:
+לדלי - ולכן מדולגות כברירת מחדל. `tests/conftest.py` מנקה את `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+לפני כל בדיקה (כדי שאף בדיקה רגילה לא תיגע ברשת בטעות), ולכן בדיקת ה-S3 החיה בונה לקוח `boto3`
+משלה, מפורשות, מ-`LIVE_AWS_ACCESS_KEY_ID`/`LIVE_AWS_SECRET_ACCESS_KEY` (I1) - בדיוק כמו ש-
+`LIVE_OPENAI_API_KEY` עוקף את הניקוי עבור OpenAI. כדי להריץ את הבדיקות, מתוך שורש הפרויקט,
+ב-Git Bash, כשה-`.env` כבר מכיל `OPENAI_API_KEY`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID` ו-
+`AWS_SECRET_ACCESS_KEY` אמיתיים:
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm --env-file .env -v "$(pwd -W):/src" -w /src python:3.12-slim \
   sh -c 'pip install -q -r requirements-dev.txt && LIVE_OPENAI_API_KEY="$OPENAI_API_KEY" \
-  LIVE_S3_BUCKET="$S3_BUCKET" RUN_LIVE_LLM=1 RUN_LIVE_S3=1 pytest -q -p no:cacheprovider tests/test_live.py'
+  LIVE_S3_BUCKET="$S3_BUCKET" LIVE_AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  LIVE_AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" RUN_LIVE_LLM=1 RUN_LIVE_S3=1 \
+  pytest -q -p no:cacheprovider tests/test_live.py'
 ```
 
-`--env-file .env` מעביר את המשתנים אל תוך ה-container בלבד; שום סוד לא מודפס לפלט.
+`--env-file .env` מעביר את המשתנים אל תוך ה-container בלבד; שום סוד לא מודפס לפלט. בדיקת ה-LLM
+החיה (I5) מריצה את `run_intake` המלא (לא רק את המסווג) על כל אחד מקובצי 2026, עם `today` קבוע
+ל-`2026-09-22` ו-`is_duplicate` שתמיד מחזיר `None`, ובודקת את כל התוצאה - `ACCEPTED` וסוגם עבור
+חמשת הקבצים הרפואיים (וגם `document_date == 2026-09-15`), ו-`NON_MEDICAL_DOCUMENT` עבור חשבון
+החשמל.
+
+בדיקת ה-S3 החיה כותבת אובייקט אמיתי לדלי (`patients/LIVE-TEST/DOC-LIVE.pdf`) ואינה מוחקת אותו -
+זהו אובייקט הדגמה בלבד, לא מטופל אמיתי, ומשמש לוודא שהכתיבה אכן מצליחה ומוצפנת; אפשר למחוק אותו
+ידנית מהקונסולה בין הרצות, אבל השארתו אינה מזיקה.
 
 ## פרטיות
 
