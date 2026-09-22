@@ -68,6 +68,9 @@ def render(issue_date: str, out_dirs: list[Path]) -> None:
 
 
 if __name__ == "__main__":
+    # The paths printed below are Hebrew; a Windows console is often cp1252.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     date_arg = sys.argv[1] if len(sys.argv) > 1 else "15.09.2026"
     outs = [Path(sys.argv[2])] if len(sys.argv) > 2 else [ROOT / "demo" / "2026", ROOT / "tests" / "fixtures" / "2026"]
     render(date_arg, outs)
