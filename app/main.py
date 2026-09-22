@@ -28,10 +28,57 @@ logger = logging.getLogger("document-service")
 CLINIC_TZ = ZoneInfo("Asia/Jerusalem")
 PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 FROM_ENV = object()  # "build this port from the environment" (the default for classifier/store)
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
 def _israel_today() -> date:
     return datetime.now(CLINIC_TZ).date()
+
+
+class AuthBeforeBodyMiddleware:
+    """Refuses an unauthenticated or oversized `/api/` request before any body is read.
+
+    FastAPI's routing parses a multipart upload - spooling it to disk, uncapped - before the
+    route function runs, so without this an unauthenticated or oversized upload would be fully
+    received first. This is a plain ASGI middleware (not `BaseHTTPMiddleware`, which itself reads
+    the whole body into memory to build a `Request`), so it inspects only the scope's headers and
+    never calls `receive()` on a refusal. The routes keep their own checks too, as defence in
+    depth for calls that reach them some other way (e.g. an internal call, or a future change
+    here)."""
+
+    def __init__(self, app, *, authorised: Callable[[Request], bool], max_body_bytes: int) -> None:
+        self.app = app
+        self.authorised = authorised
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        if not self.authorised(request):
+            await self._refuse(send, 401, "unauthorized")
+            return
+        if scope["method"] == "POST":
+            raw_length = request.headers.get("content-length")
+            if raw_length is None:
+                await self._refuse(send, 411, "length_required")
+                return
+            try:
+                length = int(raw_length)
+            except ValueError:
+                await self._refuse(send, 411, "length_required")
+                return
+            if length > self.max_body_bytes:
+                await self._refuse(send, 413, "too_large")
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _refuse(send, status: int, error: str) -> None:
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": json.dumps({"error": error}).encode()})
 
 
 def write_audit(session: Session, *, patient_id: str, operation: str, result: str,
@@ -81,6 +128,8 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
         return bool(key) and bool(supplied) and secrets.compare_digest(supplied, key)
 
     app.state.authorised = authorised
+    app.add_middleware(AuthBeforeBodyMiddleware, authorised=authorised,
+                       max_body_bytes=settings.max_upload_bytes + MULTIPART_OVERHEAD_BYTES)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
@@ -135,11 +184,19 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
                     write_audit(session, patient_id=patient_id, operation="UploadDocument",
                                 result="storage_unavailable", document_id=None, latency_ms=elapsed(started))
                     return JSONResponse(status_code=503, content={"error": "storage_unavailable"})
-            session.add(Document(document_id=document_id, patient_id=patient_id, document_type=outcome.document_type,
-                                 document_date=outcome.document_date, result=outcome.result, sha256=outcome.sha256,
-                                 size_bytes=outcome.size_bytes, s3_object_key=key))
-            write_audit(session, patient_id=patient_id, operation="UploadDocument", result=outcome.result,
-                        document_id=document_id, latency_ms=elapsed(started))
+            try:
+                session.add(Document(document_id=document_id, patient_id=patient_id,
+                                     document_type=outcome.document_type, document_date=outcome.document_date,
+                                     result=outcome.result, sha256=outcome.sha256, size_bytes=outcome.size_bytes,
+                                     s3_object_key=key))
+                write_audit(session, patient_id=patient_id, operation="UploadDocument", result=outcome.result,
+                            document_id=document_id, latency_ms=elapsed(started))
+            except SQLAlchemyError:
+                session.rollback()
+                # If `key` was set above, the object is already in S3 and now orphaned: no
+                # Document row references it, and GET only lists rows from this table, so the
+                # object is never served to anyone.
+                return JSONResponse(status_code=503, content={"error": "database_unavailable"})
         return JSONResponse(status_code=201, content={
             "document_id": document_id, "document_type": outcome.document_type,
             "document_date": outcome.document_date.isoformat() if outcome.document_date else None,

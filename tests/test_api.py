@@ -1,3 +1,5 @@
+import asyncio
+import json
 import re
 from datetime import date
 from pathlib import Path
@@ -5,15 +7,18 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.classifier import FakeClassifier
-from app.main import create_app
+from app.main import MULTIPART_OVERHEAD_BYTES, create_app
 from app.models import AuditLog, Document
 from app.storage import InMemoryObjectStore, StorageFailed
 
 FIXTURES = Path(__file__).parent / "fixtures"
 KEY = "test-key"
 H = {"X-API-Key": KEY}
+MAX_BODY_BYTES = 10 * 1024 * 1024 + MULTIPART_OVERHEAD_BYTES  # app.config.Settings.max_upload_bytes + overhead
 
 
 def pdf(year, name):
@@ -172,3 +177,112 @@ def test_the_documents_routes_are_the_whole_api(tmp_path):
     paths = app.openapi()["paths"]
     assert set(paths) == {"/health", "/api/v1/patients/{patient_id}/documents"}
     assert set(paths["/api/v1/patients/{patient_id}/documents"]) == {"get", "post"}
+
+
+def test_a_database_failure_after_storing_rolls_back_and_says_so(tmp_path, monkeypatch):
+    app, store = make(tmp_path)
+
+    def failing_commit(self):
+        raise SQLAlchemyError("boom")
+
+    monkeypatch.setattr(Session, "commit", failing_commit)
+    with TestClient(app) as client:
+        response = upload(client, "cbc")
+    assert response.status_code == 503 and response.json() == {"error": "database_unavailable"}
+    assert rows(app, Document) == [] and rows(app, AuditLog) == []
+    # The put to S3 already happened before the failing commit: the object is orphaned there,
+    # unreferenced by any row and never served, exactly as app.main documents.
+    assert len(store.objects) == 1
+
+
+# --- The auth-before-body ASGI middleware: raw ASGI calls, since FastAPI's own routing (and
+# TestClient's convenience layer) would already have parsed the body by the time a route runs. ---
+
+def http_scope(method, path, headers=()):
+    return {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+        "method": method, "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+        "root_path": "", "headers": [(k.lower().encode(), v.encode()) for k, v in headers],
+        "client": ("testclient", 50000), "server": ("testserver", 80), "state": {},
+    }
+
+
+def tracking_receive():
+    calls = {"n": 0}
+
+    async def receive():
+        calls["n"] += 1
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return receive, calls
+
+
+def call_asgi(app, scope):
+    receive, calls = tracking_receive()
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m["body"] for m in sent if m["type"] == "http.response.body")
+    return status, body, calls["n"]
+
+
+def test_an_unauthenticated_post_is_refused_before_the_body_is_read(tmp_path):
+    app, store = make(tmp_path)
+    with TestClient(app):  # runs the lifespan, so the tables exist for the row checks below
+        scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
+                           headers=[("content-length", "20000000"),
+                                    ("content-type", "multipart/form-data; boundary=x")])
+        status, body, receive_calls = call_asgi(app, scope)
+    assert status == 401 and json.loads(body) == {"error": "unauthorized"}
+    assert receive_calls == 0
+    assert rows(app, Document) == [] and rows(app, AuditLog) == []
+    assert store.objects == {}
+
+
+def test_a_post_over_the_cap_is_refused_without_reading_the_body(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app):
+        scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
+                           headers=[("x-api-key", KEY), ("content-length", str(MAX_BODY_BYTES + 1)),
+                                    ("content-type", "multipart/form-data; boundary=x")])
+        status, body, receive_calls = call_asgi(app, scope)
+    assert status == 413 and json.loads(body) == {"error": "too_large"}
+    assert receive_calls == 0
+
+
+def test_a_post_at_the_cap_is_not_refused_for_size(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app):
+        scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
+                           headers=[("x-api-key", KEY), ("content-length", str(MAX_BODY_BYTES)),
+                                    ("content-type", "multipart/form-data; boundary=x")])
+        status, _body, receive_calls = call_asgi(app, scope)
+    # Passed on size; the route itself then reads an (empty, in this bare scope) body and refuses
+    # it as an incomplete multipart request - proof this went past the middleware.
+    assert status != 413 and receive_calls >= 1
+
+
+def test_a_post_without_content_length_is_refused_without_reading_the_body(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app):
+        scope = http_scope("POST", "/api/v1/patients/P-10041/documents",
+                           headers=[("x-api-key", KEY), ("content-type", "multipart/form-data; boundary=x")])
+        status, body, receive_calls = call_asgi(app, scope)
+    assert status == 411 and json.loads(body) == {"error": "length_required"}
+    assert receive_calls == 0
+
+
+def test_get_and_health_are_unaffected_by_the_content_length_checks(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app):
+        get_scope = http_scope("GET", "/api/v1/patients/P-10041/documents", headers=[("x-api-key", KEY)])
+        status, body, _ = call_asgi(app, get_scope)
+        assert status == 200 and json.loads(body) == {"documents": []}
+
+        health_scope = http_scope("GET", "/health")  # no X-API-Key at all
+        status, body, _ = call_asgi(app, health_scope)
+        assert status == 200 and json.loads(body)["status"] == "ok"
