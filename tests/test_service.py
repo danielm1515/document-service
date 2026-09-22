@@ -44,3 +44,11 @@ def test_the_right_key_is_authorised_and_a_wrong_one_is_not(tmp_path):
         assert app.state.authorised(R()) is True
         R.headers = {"X-API-Key": "nope"}
         assert app.state.authorised(R()) is False
+
+
+def test_the_classifier_comes_from_the_environment(tmp_path, monkeypatch):
+    from app.classifier import OpenAIClassifier
+    assert make(tmp_path).state.classifier is None           # conftest cleared OPENAI_API_KEY
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    built = make(tmp_path).state.classifier
+    assert isinstance(built, OpenAIClassifier) and "sk-test" not in repr(built)

@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from .classifier import OpenAIClassifier
 from .config import Settings
 from .models import AuditLog, Base
 
@@ -63,7 +64,10 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
     app.state.settings = settings
     app.state.SessionLocal = SessionLocal
     app.state.today = today or _israel_today
-    app.state.classifier = None if classifier is FROM_ENV else classifier  # Task 3 builds it from env
+    if classifier is FROM_ENV:
+        classifier = (OpenAIClassifier(settings.openai_api_key, settings.openai_model)
+                      if settings.openai_api_key else None)
+    app.state.classifier = classifier
     app.state.store = None if store is FROM_ENV else store  # Task 4 builds it from env
 
     def authorised(request: Request) -> bool:
