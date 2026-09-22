@@ -24,6 +24,12 @@ PATIENT_MISMATCH = "PATIENT_MISMATCH"
 # (a document or customer number) is ignored rather than guessed at (design §4.2).
 _IDP_SHAPE = re.compile(r"P-\d+")
 
+# A crafted PDF within the 10 MB size limit can still decompress to many pages or a lot of text;
+# the demo documents are one page. Both bounds make DOCUMENT_UNREADABLE instead of doing
+# unbounded work on hostile input.
+MAX_PAGES = 20
+MAX_TEXT_BYTES = 200_000
+
 
 @dataclass(frozen=True)
 class IntakeOutcome:
@@ -37,7 +43,17 @@ class IntakeOutcome:
 def _text_of(data: bytes) -> str | None:
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
-        return "".join(page.extract_text() or "" for page in reader.pages)
+        if len(reader.pages) > MAX_PAGES:
+            return None
+        parts: list[str] = []
+        total = 0
+        for page in reader.pages:
+            piece = page.extract_text() or ""
+            parts.append(piece)
+            total += len(piece)
+            if total > MAX_TEXT_BYTES:
+                return None
+        return "".join(parts)
     except Exception:  # any parse failure is "unreadable", never a crash
         return None
 

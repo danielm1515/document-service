@@ -9,16 +9,18 @@ from datetime import date, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Path as ApiPath, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .classifier import OpenAIClassifier
 from .config import Settings
-from .models import AuditLog, Base
+from .intake import ACCEPTED, run_intake
+from .models import AuditLog, Base, Document
+from .storage import S3ObjectStore, StorageFailed
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("document-service")
@@ -68,7 +70,9 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
         classifier = (OpenAIClassifier(settings.openai_api_key, settings.openai_model)
                       if settings.openai_api_key else None)
     app.state.classifier = classifier
-    app.state.store = None if store is FROM_ENV else store  # Task 4 builds it from env
+    if store is FROM_ENV:
+        store = S3ObjectStore(settings.s3_bucket, settings.aws_region) if settings.s3_bucket else None
+    app.state.store = store
 
     def authorised(request: Request) -> bool:
         if not auth_on:
@@ -94,6 +98,68 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
             "classifier": "configured" if request.app.state.classifier is not None else "not_configured",
             "storage": "configured" if request.app.state.store is not None else "not_configured",
         })
+
+    def unauthorised() -> JSONResponse:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"}, headers={"WWW-Authenticate": "ApiKey"})
+
+    def elapsed(started: float) -> int:
+        return round((time.perf_counter() - started) * 1000)
+
+    @app.post("/api/v1/patients/{patient_id}/documents", status_code=201, tags=["Documents"])
+    def upload_document(request: Request, patient_id: str = ApiPath(pattern=PATIENT_ID_PATTERN),
+                        file: UploadFile = File(...)) -> JSONResponse:
+        """Checks and classifies one PDF; stores it only if accepted (design §4.2)."""
+        if not authorised(request):
+            return unauthorised()
+        state = request.app.state
+        if state.classifier is None or state.store is None:
+            return JSONResponse(status_code=503, content={"error": "service_not_configured"})
+        started = time.perf_counter()
+        limit = state.settings.max_upload_bytes
+        data = file.file.read(limit + 1)  # one byte over the limit is enough to know it is too big
+        with state.SessionLocal() as session:
+            def accepted_duplicate(sha: str) -> bool:
+                return session.scalar(select(Document.document_id).where(
+                    Document.patient_id == patient_id, Document.sha256 == sha, Document.result == ACCEPTED)
+                    .limit(1)) is not None
+
+            outcome = run_intake(data, patient_id, classifier=state.classifier, today=state.today(),
+                                 is_duplicate=accepted_duplicate, max_bytes=limit)
+            document_id = f"DOC-{secrets.token_hex(6).upper()}"
+            key = None
+            if outcome.result == ACCEPTED:
+                key = f"patients/{patient_id}/{document_id}.pdf"
+                try:
+                    state.store.put(key, data)
+                except StorageFailed:
+                    write_audit(session, patient_id=patient_id, operation="UploadDocument",
+                                result="storage_unavailable", document_id=None, latency_ms=elapsed(started))
+                    return JSONResponse(status_code=503, content={"error": "storage_unavailable"})
+            session.add(Document(document_id=document_id, patient_id=patient_id, document_type=outcome.document_type,
+                                 document_date=outcome.document_date, result=outcome.result, sha256=outcome.sha256,
+                                 size_bytes=outcome.size_bytes, s3_object_key=key))
+            write_audit(session, patient_id=patient_id, operation="UploadDocument", result=outcome.result,
+                        document_id=document_id, latency_ms=elapsed(started))
+        return JSONResponse(status_code=201, content={
+            "document_id": document_id, "document_type": outcome.document_type,
+            "document_date": outcome.document_date.isoformat() if outcome.document_date else None,
+            "result": outcome.result})
+
+    @app.get("/api/v1/patients/{patient_id}/documents", tags=["Documents"])
+    def list_documents(request: Request, patient_id: str = ApiPath(pattern=PATIENT_ID_PATTERN)) -> JSONResponse:
+        """The patient's documents, oldest first, with their intake results (for CheckDocuments)."""
+        if not authorised(request):
+            return unauthorised()
+        started = time.perf_counter()
+        with request.app.state.SessionLocal() as session:
+            documents = list(session.scalars(select(Document).where(Document.patient_id == patient_id)
+                                             .order_by(Document.uploaded_at, Document.document_id)))
+            write_audit(session, patient_id=patient_id, operation="ListDocuments", result="ok",
+                        document_id=None, latency_ms=elapsed(started))
+        return JSONResponse({"documents": [{
+            "document_id": d.document_id, "document_type": d.document_type,
+            "document_date": d.document_date.isoformat() if d.document_date else None,
+            "result": d.result, "uploaded_at": d.uploaded_at.isoformat()} for d in documents]})
 
     return app
 

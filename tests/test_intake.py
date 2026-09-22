@@ -109,3 +109,23 @@ def test_validity_is_per_type_and_inclusive(doc_type, age_days, result):
 def test_a_rejected_outcome_keeps_its_hash_and_size():
     outcome = intake(data("2026", "electricity_bill"))
     assert outcome.document_type is None and len(outcome.sha256) == 64 and outcome.size_bytes > 0
+
+
+def _merged_pdf(pages):
+    import io
+    import pypdf
+    reader = pypdf.PdfReader(io.BytesIO(data("2026", "cbc")))
+    writer = pypdf.PdfWriter()
+    for _ in range(pages):
+        writer.add_page(reader.pages[0])
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_a_pdf_with_more_than_20_pages_is_unreadable():
+    assert intake(_merged_pdf(21)).result == DOCUMENT_UNREADABLE
+
+
+def test_a_pdf_with_20_pages_is_accepted():
+    assert intake(_merged_pdf(20)).result == ACCEPTED

@@ -52,3 +52,11 @@ def test_the_classifier_comes_from_the_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     built = make(tmp_path).state.classifier
     assert isinstance(built, OpenAIClassifier) and "sk-test" not in repr(built)
+
+
+def test_the_store_comes_from_the_environment(tmp_path, monkeypatch):
+    from app.storage import S3ObjectStore
+    assert make(tmp_path).state.store is None
+    monkeypatch.setenv("S3_BUCKET", "hospital-docs-test")
+    built = make(tmp_path).state.store
+    assert isinstance(built, S3ObjectStore) and built.bucket == "hospital-docs-test" and built.region == "eu-north-1"
