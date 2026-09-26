@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import re
 from datetime import date, datetime, timezone
@@ -10,7 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.classifier import FakeClassifier
+from app.classifier import ClassifierUnavailable, FakeClassifier
 from app.main import MULTIPART_OVERHEAD_BYTES, create_app
 from app.models import AuditLog, Document
 from app.storage import InMemoryObjectStore, StorageFailed
@@ -51,7 +52,7 @@ def test_an_accepted_document_is_stored_and_listed(tmp_path):
     body = response.json()
     assert re.fullmatch(r"DOC-[0-9A-F]{12}", body["document_id"])
     assert body == {"document_id": body["document_id"], "document_type": "CBC",
-                    "document_date": "2026-09-15", "result": "ACCEPTED"}
+                    "document_date": "2026-09-15", "result": "ACCEPTED", "reason": None}
     assert list(store.objects) == [f"patients/P-10041/{body['document_id']}.pdf"]
     assert store.objects[f"patients/P-10041/{body['document_id']}.pdf"] == pdf("2026", "cbc")
     [doc] = listing["documents"]
@@ -190,7 +191,7 @@ def test_without_a_classifier_or_a_store_nothing_is_accepted(tmp_path):
 
 def test_a_storage_failure_stores_nothing_and_says_so(tmp_path):
     class Failing:
-        def put(self, key, data):
+        def put(self, key, data, content_type="application/pdf"):
             raise StorageFailed("AccessDenied")
     app, _ = make(tmp_path, store=Failing())
     with TestClient(app) as client:
@@ -198,6 +199,27 @@ def test_a_storage_failure_stores_nothing_and_says_so(tmp_path):
     assert response.status_code == 503 and response.json() == {"error": "storage_unavailable"}
     assert rows(app, Document) == []
     assert [(a.operation, a.result) for a in rows(app, AuditLog)] == [("UploadDocument", "storage_unavailable")]
+
+
+# --- Task 2, decision 1: a classifier provider failure is 503 classifier_unavailable, the same
+# pattern as storage_unavailable above - never a verdict on the file, no Document row. ---
+
+class _UnavailableClassifier:
+    def classify(self, text):
+        raise ClassifierUnavailable("api:RateLimitError")
+
+    def classify_images(self, images):
+        raise ClassifierUnavailable("api:RateLimitError")
+
+
+def test_a_classifier_provider_failure_is_503_with_no_document_row(tmp_path):
+    app, store = make(tmp_path, classifier=_UnavailableClassifier())
+    with TestClient(app) as client:
+        response = upload(client, "cbc")
+    assert response.status_code == 503 and response.json() == {"error": "classifier_unavailable"}
+    assert rows(app, Document) == []
+    assert store.objects == {}
+    assert [(a.operation, a.result) for a in rows(app, AuditLog)] == [("UploadDocument", "classifier_unavailable")]
 
 
 def test_the_audit_holds_codes_and_ids_only(tmp_path):
@@ -219,6 +241,91 @@ def test_the_log_never_holds_the_patient_id_or_a_file_name(tmp_path, caplog):
     # Only this service's own logger: the test client's httpx logs the request URL itself.
     logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "document-service")
     assert "P-10041" not in logged and "cbc.pdf" not in logged
+
+
+# --- Task 2, decision 2: a fixed reason code on every refusal, in the 201 body and the log line -
+# never document content, a patient id or a file name. ---
+
+def test_reason_codes_appear_in_the_body_and_the_log_never_with_document_content(tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="document-service")
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        expired = upload(client, "cbc", year="2024")
+        non_medical = upload(client, "electricity_bill")
+        garbage = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                              files={"file": ("x.gif", b"GIF89a not a real file, just text", "image/gif")})
+    assert expired.json()["reason"] == "too_old"
+    assert non_medical.json()["reason"] is None
+    assert garbage.status_code == 201 and garbage.json()["reason"] == "not_supported_format"
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "document-service")
+    assert '"reason": "too_old"' in logged and '"reason": "not_supported_format"' in logged
+    assert "P-10041" not in logged
+    assert "cbc.pdf" not in logged and "electricity_bill.pdf" not in logged and "x.gif" not in logged
+    assert "GIF89a not a real file" not in logged
+
+
+def test_an_unsupported_format_upload_is_not_supported_format(tmp_path):
+    app, store = make(tmp_path)
+    with TestClient(app) as client:
+        response = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                               files={"file": ("note.txt", b"just some plain text", "text/plain")})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["result"] == "DOCUMENT_UNREADABLE" and body["reason"] == "not_supported_format"
+    assert store.objects == {}
+
+
+# --- Task 2, decision 3: an image, or a scanned PDF with no text layer, is classified through
+# vision (FakeClassifier.classify_images); storage.py sets ContentType, main.py sets the object
+# key's extension, per kind. ---
+
+def _pil_image_bytes(fmt: str, size: tuple[int, int] = (30, 30)) -> bytes:
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color=(1, 2, 3)).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def _scanned_pdf_bytes() -> bytes:
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (600, 800), color=(9, 9, 9)).save(buffer, format="PDF")
+    return buffer.getvalue()
+
+
+def test_jpeg_and_png_uploads_are_accepted_through_vision_with_content_type_and_extension_per_kind(tmp_path):
+    app, store = make(tmp_path)
+    with TestClient(app) as client:
+        jpeg_body = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                                files={"file": ("scan.jpg", _pil_image_bytes("JPEG"), "image/jpeg")}).json()
+        png_body = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                               files={"file": ("scan.png", _pil_image_bytes("PNG"), "image/png")}).json()
+    assert jpeg_body["result"] == "ACCEPTED" and jpeg_body["document_type"] == "CBC"
+    assert png_body["result"] == "ACCEPTED" and png_body["document_type"] == "CBC"
+    jpeg_key = f"patients/P-10041/{jpeg_body['document_id']}.jpg"
+    png_key = f"patients/P-10041/{png_body['document_id']}.png"
+    assert list(store.objects) == [jpeg_key, png_key]
+    assert store.content_types[jpeg_key] == "image/jpeg"
+    assert store.content_types[png_key] == "image/png"
+
+
+def test_a_pdf_upload_still_gets_the_pdf_extension_and_content_type(tmp_path):
+    app, store = make(tmp_path)
+    with TestClient(app) as client:
+        body = upload(client, "cbc").json()
+    key = f"patients/P-10041/{body['document_id']}.pdf"
+    assert store.content_types[key] == "application/pdf"
+
+
+def test_a_scanned_pdf_upload_is_classified_through_vision(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        response = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                               files={"file": ("scan.pdf", _scanned_pdf_bytes(), "application/pdf")})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["result"] == "ACCEPTED" and body["document_type"] == "CBC" and body["reason"] is None
 
 
 def test_the_documents_routes_are_the_whole_api(tmp_path):
@@ -273,7 +380,7 @@ def test_a_database_failure_at_the_duplicate_check_is_503_and_never_logged(tmp_p
 
 def test_a_database_failure_writing_the_storage_failure_audit_is_503(tmp_path, monkeypatch):
     class Failing:
-        def put(self, key, data):
+        def put(self, key, data, content_type="application/pdf"):
             raise StorageFailed("AccessDenied")
 
     def failing_commit(self):
