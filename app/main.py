@@ -201,7 +201,7 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
     @app.post("/api/v1/patients/{patient_id}/documents", status_code=201, tags=["Documents"])
     def upload_document(request: Request, patient_id: str = ApiPath(pattern=PATIENT_ID_PATTERN),
                         file: UploadFile = File(...)) -> JSONResponse:
-        """Checks and classifies one PDF; stores it only if accepted (design §4.2)."""
+        """Checks and classifies one PDF, JPEG or PNG; stores it only if accepted (design §4.2)."""
         if not authorised(request):
             return unauthorised()
         state = request.app.state
