@@ -222,6 +222,34 @@ def test_a_classifier_provider_failure_is_503_with_no_document_row(tmp_path):
     assert [(a.operation, a.result) for a in rows(app, AuditLog)] == [("UploadDocument", "classifier_unavailable")]
 
 
+# --- Review round 1, I2: the provider code itself (e.g. "api:RateLimitError") is kept in the
+# log line, sanitised to [A-Za-z0-9_:]{1,80} - not just the bare fact of failure. (The audit
+# table itself has no reason column - see write_audit's docstring - so this is log-only, like
+# every other reason code.) ---
+
+def test_the_classifier_unavailable_log_line_carries_the_sanitised_provider_code(tmp_path, caplog):
+    import logging
+    import re as re_module
+
+    class _NoisyUnavailable:
+        def classify(self, text):
+            raise ClassifierUnavailable("api:RateLimitError: quota <exceeded>! 100%")
+
+        def classify_images(self, images):
+            raise ClassifierUnavailable("api:RateLimitError: quota <exceeded>! 100%")
+
+    caplog.set_level(logging.INFO, logger="document-service")
+    app, _ = make(tmp_path, classifier=_NoisyUnavailable())
+    with TestClient(app) as client:
+        upload(client, "cbc")
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "document-service")
+    parsed = json.loads(logged)
+    assert re_module.fullmatch(r"[A-Za-z0-9_:]{1,80}", parsed["reason"])
+    assert parsed["reason"] == "api:RateLimitError:quotaexceeded100"  # unsafe characters dropped, not replaced
+    assert "quota <exceeded>" not in logged and "100%" not in logged
+
+
+
 def test_the_audit_holds_codes_and_ids_only(tmp_path):
     app, _ = make(tmp_path)
     with TestClient(app) as client:

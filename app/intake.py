@@ -4,15 +4,22 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 
 import pypdf
+from PIL import Image, ImageOps
 
 from .catalog import BY_CODE
 from .classifier import Classifier, ClassifierFailed
 from .magic import sniff_kind
+
+# A firm ceiling on decoded pixel count (review I3): Pillow's own default (~89M) only warns below
+# 2x itself, so this module additionally turns that warning into an error inside _downscale. Set
+# once, at import time - a global on PIL.Image, not per-call state.
+Image.MAX_IMAGE_PIXELS = 25_000_000
 
 ACCEPTED = "ACCEPTED"
 NON_MEDICAL_DOCUMENT = "NON_MEDICAL_DOCUMENT"
@@ -37,6 +44,15 @@ MAX_TEXT_BYTES = 200_000
 # the same way, so a hostile file cannot make this do unbounded work either.
 MAX_IMAGES = 4
 MAX_IMAGE_DIMENSION = 1600
+# A page image below this on both sides is an icon or a logo, not a scan (review M1).
+MIN_IMAGE_DIMENSION = 200
+# Declared (not yet decoded) pixel count above which an embedded image is skipped outright
+# (review I3) - kept equal to Image.MAX_IMAGE_PIXELS above.
+MAX_DECLARED_PIXELS = 25_000_000
+# Fewer than this many non-whitespace characters is treated as no usable text layer, even if
+# extraction technically returned something (a header/footer/watermark on an otherwise scanned
+# page) - review M5.
+MIN_TEXT_CHARS = 40
 
 
 @dataclass(frozen=True)
@@ -93,33 +109,77 @@ def _text_of(data: bytes) -> str:
 
 
 def _downscale(data: bytes) -> bytes | None:
-    """Re-encodes one embedded page image as a JPEG no larger than MAX_IMAGE_DIMENSION on its long
-    side. `None` if Pillow cannot make sense of it (a corrupt or unsupported embedded image is
-    simply skipped, not a crash)."""
+    """Re-encodes one image - a standalone upload or an embedded PDF page image - as a JPEG no
+    larger than MAX_IMAGE_DIMENSION on its long side, EXIF orientation applied and EXIF itself
+    stripped by the re-encode (review I1). `None` for anything Pillow cannot make sense of, or
+    that is a decompression-bomb risk (review I3): `Image.open` reports pixel dimensions before
+    any pixel is decoded, so an over-declared image is rejected there, and a Pillow
+    DecompressionBombWarning (a size Pillow would otherwise only warn about) is escalated to an
+    exception for this call. A corrupt, hostile or oversized image is simply skipped, never a
+    crash and never unbounded work."""
     try:
-        from PIL import Image
-    except ImportError:
-        return None
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            image = image.convert("RGB")
-            width, height = image.size
-            longest = max(width, height)
-            if longest > MAX_IMAGE_DIMENSION:
-                scale = MAX_IMAGE_DIMENSION / longest
-                image = image.resize((max(1, round(width * scale)), max(1, round(height * scale))))
-            out = io.BytesIO()
-            image.save(out, format="JPEG", quality=85)
-            return out.getvalue()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size  # header only - no pixel has been decoded yet
+                if width * height > MAX_DECLARED_PIXELS:
+                    return None
+                if image.format == "JPEG":
+                    # Lets libjpeg decode directly at roughly the target size instead of full
+                    # resolution - a no-op for any other format (Pillow's base Image.draft).
+                    image.draft("RGB", (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+                image = ImageOps.exif_transpose(image)
+                image = image.convert("RGB")
+                width, height = image.size
+                longest = max(width, height)
+                if longest > MAX_IMAGE_DIMENSION:
+                    scale = MAX_IMAGE_DIMENSION / longest
+                    image = image.resize((max(1, round(width * scale)), max(1, round(height * scale))))
+                out = io.BytesIO()
+                image.save(out, format="JPEG", quality=85)
+                return out.getvalue()
     except Exception:
         return None
 
 
+def _largest_usable_image_name(page: pypdf.PageObject) -> str | None:
+    """The resource name (e.g. `/Im0`) of the largest embedded image on this page worth sending to
+    vision - not a tiny icon or logo (review M1), not so large its *declared* pixel count alone is
+    a decompression-bomb risk (review I3). Reads only the page's `/Resources -> /XObject`
+    dictionary's declared `/Width`/`/Height` - never decodes a single pixel, so an oversized
+    candidate is skipped without ever being opened. `None` if the page has no usable image."""
+    try:
+        resources = page.get("/Resources")
+        xobjects = resources.get("/XObject") if resources else None
+    except Exception:
+        return None
+    if not xobjects:
+        return None
+    best_name, best_area = None, 0
+    for name in xobjects:
+        try:
+            xobj = xobjects[name]
+            if xobj.get("/Subtype") != "/Image":
+                continue
+            width, height = int(xobj.get("/Width", 0)), int(xobj.get("/Height", 0))
+        except Exception:
+            continue
+        if width < MIN_IMAGE_DIMENSION and height < MIN_IMAGE_DIMENSION:
+            continue  # an icon or a logo, not a page scan
+        area = width * height
+        if area == 0 or area > MAX_DECLARED_PIXELS:
+            continue
+        if area > best_area:
+            best_name, best_area = name, area
+    return best_name
+
+
 def _page_images(data: bytes) -> list[bytes]:
-    """The first pages' embedded images, at most MAX_IMAGES, downscaled - for a PDF whose
-    extracted text was empty (a scan). Any failure (a corrupt PDF, an unreadable embedded image)
-    yields fewer images rather than raising; an empty result means "no usable image", which the
-    caller reports as `no_text_layer`."""
+    """The largest usable embedded image on each of the first pages, at most MAX_IMAGES - for a
+    PDF whose extracted text was empty or too short (a scan). A page whose only images are tiny,
+    oversized or fail to decode contributes nothing - it is not retried with a smaller candidate
+    on the same page (review M1's "fail closed for that page"); an empty result means "no usable
+    image anywhere", which the caller reports as `no_text_layer`."""
     images: list[bytes] = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
@@ -128,16 +188,16 @@ def _page_images(data: bytes) -> list[bytes]:
     for page in reader.pages:
         if len(images) >= MAX_IMAGES:
             break
+        name = _largest_usable_image_name(page)
+        if name is None:
+            continue
         try:
-            page_images = list(page.images)
+            raw = page.images[name].data
         except Exception:
             continue
-        for image_file in page_images:
-            if len(images) >= MAX_IMAGES:
-                break
-            downscaled = _downscale(image_file.data)
-            if downscaled is not None:
-                images.append(downscaled)
+        downscaled = _downscale(raw)
+        if downscaled is not None:
+            images.append(downscaled)
     return images
 
 
@@ -156,18 +216,22 @@ def run_intake(data: bytes, patient_id: str, *, classifier: Classifier, today: d
     kind = sniff_kind(data)
     if kind is None:
         return outcome(DOCUMENT_UNREADABLE, reason="not_supported_format")
-    # 3. an image goes straight to vision; a PDF is parsed for its text, and only when that text is
-    # empty (a scan) does it fall back to its own page images, also through vision
+    # 3. an image goes straight to vision (downscaled/EXIF-stripped like any page image - review
+    # I1); a PDF is parsed for its text, and only when that text is too short to be useful (review
+    # M5) does it fall back to its own page images, also through vision
     text: str | None = None
     images: list[bytes] | None = None
     if kind in ("jpeg", "png"):
-        images = [data]
+        downscaled = _downscale(data)
+        if downscaled is None:
+            return outcome(DOCUMENT_UNREADABLE, reason="parse_error")
+        images = [downscaled]
     else:
         try:
             text = _text_of(data)
         except _TextExtractionFailed as exc:
             return outcome(DOCUMENT_UNREADABLE, reason=exc.reason)
-        if not text.strip():
+        if len(re.sub(r"\s+", "", text)) < MIN_TEXT_CHARS:
             text = None
             images = _page_images(data)
             if not images:

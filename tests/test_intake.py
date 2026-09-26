@@ -209,19 +209,32 @@ def test_a_pdf_with_20_pages_is_accepted():
 # classifier.classify_images instead - same duplicate/type/ownership/validity logic downstream.
 # FakeClassifier.classify_images always answers CBC dated 2026-09-15 (see app/classifier.py). ---
 
-def _solid_image(fmt: str) -> bytes:
+def _solid_image(fmt: str, size: tuple[int, int] = (40, 40)) -> bytes:
     from PIL import Image
     buffer = io.BytesIO()
-    Image.new("RGB", (40, 40), color=(10, 20, 30)).save(buffer, format=fmt)
+    Image.new("RGB", size, color=(10, 20, 30)).save(buffer, format=fmt)
     return buffer.getvalue()
 
 
-def _scanned_pdf() -> bytes:
+def _scanned_pdf(size: tuple[int, int] = (800, 600)) -> bytes:
     """A single-page PDF whose only content is an embedded image - no text layer, exactly what a
     scanner produces - built with Pillow's own PDF writer rather than a hand-crafted fixture."""
     from PIL import Image
     buffer = io.BytesIO()
-    Image.new("RGB", (800, 600), color=(5, 5, 5)).save(buffer, format="PDF")
+    Image.new("RGB", size, color=(5, 5, 5)).save(buffer, format="PDF")
+    return buffer.getvalue()
+
+
+def _multi_page_scan(count: int, size: tuple[int, int] = (600, 400)) -> bytes:
+    """`count` pages, each with its own embedded image - built by merging `count` one-image PDFs
+    (Pillow can only ever write a single-image page itself)."""
+    import pypdf
+    writer = pypdf.PdfWriter()
+    for i in range(count):
+        reader = pypdf.PdfReader(io.BytesIO(_scanned_pdf(size)))
+        writer.add_page(reader.pages[0])
+    buffer = io.BytesIO()
+    writer.write(buffer)
     return buffer.getvalue()
 
 
@@ -250,3 +263,255 @@ def test_an_image_upload_is_still_subject_to_the_duplicate_check():
             raise AssertionError("a duplicate must not reach the classifier")
     outcome = intake(raw, classifier=Boom(), duplicates={first.sha256: original})
     assert outcome.result == DUPLICATE_DOCUMENT
+
+
+# --- Review round 1, I1: a standalone image is downscaled/EXIF-stripped exactly like an
+# embedded page image, not sent raw. A decode failure is DOCUMENT_UNREADABLE/parse_error, never
+# a 503 (that stays reserved for a provider failure). ---
+
+def _truncated_jpeg() -> bytes:
+    full = _solid_image("JPEG", (300, 200))
+    return full[: len(full) // 2]
+
+
+def _jpeg_with_exif(size=(300, 100)) -> bytes:
+    """A JPEG whose EXIF says "rotate 90 degrees" and carries an arbitrary comment tag - both
+    should be gone from what actually reaches the classifier."""
+    from PIL import Image
+    image = Image.new("RGB", size, color=(40, 60, 80))
+    exif = image.getexif()
+    exif[0x0112] = 6  # Orientation: rotate 90 CW
+    exif[0x9286] = "a free-text EXIF comment, never sent to the model"  # UserComment
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", exif=exif.tobytes())
+    return buffer.getvalue()
+
+
+class Spy:
+    """Captures whatever run_intake actually sends to vision, without answering anything itself
+    but a fixed CBC (like FakeClassifier) - for asserting on the images argument."""
+
+    def __init__(self):
+        self.images: list[bytes] | None = None
+
+    def classify(self, text):
+        raise AssertionError("the vision path must not fall back to text")
+
+    def classify_images(self, images):
+        self.images = list(images)
+        return Classification(True, "CBC", date(2026, 9, 15), None)
+
+
+def test_a_truncated_jpeg_upload_has_the_parse_error_reason():
+    outcome = intake(_truncated_jpeg())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "parse_error"
+
+
+def test_a_jpeg_uploads_exif_is_stripped_and_its_orientation_applied():
+    from PIL import Image
+    spy = Spy()
+    outcome = intake(_jpeg_with_exif(), classifier=spy)
+    assert outcome.result == ACCEPTED
+    [sent] = spy.images
+    assert b"Exif" not in sent
+    reopened = Image.open(io.BytesIO(sent))
+    assert dict(reopened.getexif()) == {}
+    assert reopened.size == (100, 300)  # the 90-degree rotation swapped width and height
+
+
+# --- Review round 1, I3: a decompression-bomb-sized image is skipped (or refused), never fully
+# decoded. A crafted file can declare a huge size in its header while staying tiny on disk. ---
+
+def _png_declaring_huge_dimensions(width: int = 20000, height: int = 20000) -> bytes:
+    """A syntactically valid but tiny PNG (a real IHDR chunk, a throwaway IDAT never meant to
+    actually decode) that declares `width`x`height` pixels - Pillow reads that from the header
+    alone, without ever touching IDAT, so this is instant regardless of the declared size."""
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+    idat = chunk(b"IDAT", zlib.compress(b"\x00" * 3))  # never actually decoded
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + idat + chunk(b"IEND", b"")
+
+
+def _pdf_with_an_oversized_declared_image() -> bytes:
+    """A page whose one embedded image XObject declares 20000x20000 pixels in its dictionary,
+    with a 10-byte garbage stream that is never actually decoded - _largest_usable_image_name
+    must reject it from the dictionary alone."""
+    import pypdf
+    from pypdf.generic import DictionaryObject, NameObject, NumberObject, StreamObject
+
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    xobj = StreamObject()
+    xobj.set_data(b"\x00" * 10)
+    xobj[NameObject("/Type")] = NameObject("/XObject")
+    xobj[NameObject("/Subtype")] = NameObject("/Image")
+    xobj[NameObject("/Width")] = NumberObject(20000)
+    xobj[NameObject("/Height")] = NumberObject(20000)
+    xobj[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    xobj[NameObject("/BitsPerComponent")] = NumberObject(8)
+    ref = writer._add_object(xobj)
+    if "/Resources" not in page:
+        page[NameObject("/Resources")] = DictionaryObject()
+    resources = page["/Resources"]
+    if "/XObject" not in resources:
+        resources[NameObject("/XObject")] = DictionaryObject()
+    resources["/XObject"][NameObject("/Im0")] = ref
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_a_standalone_image_declaring_a_huge_size_is_refused_quickly_as_parse_error():
+    outcome = intake(_png_declaring_huge_dimensions())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "parse_error"
+
+
+def test_a_standalone_image_in_the_warn_only_band_is_still_refused():
+    """36,000,000 declared pixels - above MAX_DECLARED_PIXELS (25M) but below Pillow's own
+    default hard-error threshold (2x its MAX_IMAGE_PIXELS), so Pillow would only warn unless the
+    warning is escalated to an error inside _downscale."""
+    outcome = intake(_png_declaring_huge_dimensions(6000, 6000))
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "parse_error"
+
+
+def test_a_pdf_page_with_only_an_oversized_declared_image_yields_no_text_layer():
+    """The garbage 10-byte stream would fail to decode as a 20000x20000 image anyway - this
+    proves the rejection happens from the declared size, since app.intake._largest_usable_image_name
+    never calls page.images (which would attempt exactly that failing decode)."""
+    from app.intake import _largest_usable_image_name
+    import pypdf
+    reader = pypdf.PdfReader(io.BytesIO(_pdf_with_an_oversized_declared_image()))
+    assert _largest_usable_image_name(reader.pages[0]) is None
+    outcome = intake(_pdf_with_an_oversized_declared_image())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "no_text_layer"
+
+
+# --- Review round 1, I4: the vision path carries every downstream check (validity, ownership,
+# type) exactly like the text path, is bounded to MAX_IMAGES per document, downscales a large
+# embedded scan, and accepts whatever colour mode Pillow hands back for an embedded image. ---
+
+class ScriptedImages:
+    """Like test_intake.Scripted, but for the vision path - classify_images answers a fixed
+    Classification (or raises), and classify() must never be called."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    def classify(self, text):
+        raise AssertionError("the vision path must not fall back to text")
+
+    def classify_images(self, images):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+@pytest.mark.parametrize("answer, result, reason", [
+    (Classification(True, "CBC", date(2020, 1, 1), None), DOCUMENT_EXPIRED, "too_old"),
+    (Classification(True, "CBC", date(2026, 9, 1), "P-20000"), PATIENT_MISMATCH, None),
+    (Classification(True, None, date(2026, 9, 1), None), DOCUMENT_UNREADABLE, "unknown_type"),
+])
+def test_each_classification_outcome_through_vision(answer, result, reason):
+    outcome = intake(_solid_image("JPEG"), classifier=ScriptedImages(answer))
+    assert outcome.result == result and outcome.reason == reason
+
+
+def test_a_large_embedded_scan_is_downscaled_to_at_most_1600_on_the_long_side():
+    from PIL import Image
+    spy = Spy()
+    intake(_scanned_pdf((4000, 3000)), classifier=spy)
+    [sent] = spy.images
+    width, height = Image.open(io.BytesIO(sent)).size
+    assert max(width, height) <= 1600
+
+
+def test_a_six_page_scan_sends_exactly_four_images():
+    spy = Spy()
+    intake(_multi_page_scan(6), classifier=spy)
+    assert len(spy.images) == 4
+
+
+def test_an_rgba_image_converts_without_crashing():
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGBA", (50, 50), color=(1, 2, 3, 128)).save(buffer, format="PNG")
+    outcome = intake(buffer.getvalue())
+    assert outcome.result == ACCEPTED
+
+
+def test_a_palette_image_converts_without_crashing():
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("P", (50, 50)).save(buffer, format="PNG")
+    outcome = intake(buffer.getvalue())
+    assert outcome.result == ACCEPTED
+
+
+# --- Review round 1, M1: image selection skips a tiny image and takes the largest per page. ---
+
+def test_a_tiny_embedded_image_is_skipped_as_an_icon_not_a_scan():
+    """Both sides under MIN_IMAGE_DIMENSION (a logo, not a page) - the page contributes nothing,
+    and since it is the only page, the whole document is no_text_layer."""
+    outcome = intake(_scanned_pdf((100, 80)))
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "no_text_layer"
+
+
+def test_the_largest_image_on_a_page_is_the_one_sent():
+    import pypdf
+    from pypdf.generic import DictionaryObject, NameObject, NumberObject, StreamObject
+
+    from app.intake import _largest_usable_image_name
+
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    resources = DictionaryObject()
+    xobjects = DictionaryObject()
+    for name, (w, h) in (("/Small", (300, 300)), ("/Big", (900, 900))):
+        xobj = StreamObject()
+        xobj.set_data(b"\x00" * 10)
+        xobj[NameObject("/Type")] = NameObject("/XObject")
+        xobj[NameObject("/Subtype")] = NameObject("/Image")
+        xobj[NameObject("/Width")] = NumberObject(w)
+        xobj[NameObject("/Height")] = NumberObject(h)
+        xobjects[NameObject(name)] = writer._add_object(xobj)
+    resources[NameObject("/XObject")] = xobjects
+    page[NameObject("/Resources")] = resources
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    reader = pypdf.PdfReader(io.BytesIO(buffer.getvalue()))
+    assert _largest_usable_image_name(reader.pages[0]) == "/Big"
+
+
+# --- Review round 1, M5: too little extracted text (under 40 non-space characters) takes the
+# vision path, even though extraction technically returned something - a watermark or a page
+# number must not block the vision fallback the way truly empty text already did. ---
+
+def test_a_short_watermark_of_a_text_layer_still_takes_the_vision_path(monkeypatch):
+    """Isolates the MIN_TEXT_CHARS threshold: a page reporting real but short text (under 40
+    non-space characters) must still reach classify_images, not classify(text) - proven by
+    replacing _page_images with a canned answer and checking that is exactly what the classifier
+    receives."""
+    import app.intake as intake_module
+
+    class FakePage:
+        def extract_text(self):
+            return "עותק - לא לשימוש"  # 15 non-space characters, well under MIN_TEXT_CHARS
+
+        def get(self, _key):
+            return None
+
+    class FakeReader:
+        def __init__(self, *_args, **_kwargs):
+            self.pages = [FakePage()]
+
+    monkeypatch.setattr(intake_module.pypdf, "PdfReader", FakeReader)
+    monkeypatch.setattr(intake_module, "_page_images", lambda data: [b"fake-page-image"])
+    spy = Spy()
+    outcome = intake(b"%PDF-fake", classifier=spy)
+    assert outcome.result == ACCEPTED
+    assert spy.images == [b"fake-page-image"]

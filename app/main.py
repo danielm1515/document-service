@@ -33,6 +33,14 @@ CLINIC_TZ = ZoneInfo("Asia/Jerusalem")
 PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 FROM_ENV = object()  # "build this port from the environment" (the default for classifier/store)
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
+# ClassifierUnavailable's message is already a fixed code (e.g. "api:RateLimitError"), never
+# document content - this is a second line of defence should some future OpenAIError subclass
+# embed anything freer-form (review I2).
+_UNSAFE_REASON_CHARS = re.compile(r"[^A-Za-z0-9_:]")
+
+
+def _sanitize_provider_reason(raw: str) -> str:
+    return _UNSAFE_REASON_CHARS.sub("", raw)[:80] or "unknown"
 
 
 def _israel_today() -> date:
@@ -218,11 +226,14 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
                 try:
                     outcome = run_intake(data, patient_id, classifier=state.classifier, today=state.today(),
                                          is_duplicate=accepted_duplicate, max_bytes=limit)
-                except ClassifierUnavailable:
+                except ClassifierUnavailable as exc:
                     # A provider failure is never a verdict on the file (Task 2, decision 1) - the
                     # same pattern as storage_unavailable below: an audit row, no Document row.
+                    # The provider code (e.g. "api:RateLimitError") is kept, not just the fact of
+                    # failure (review I2) - sanitised, since it is logged.
                     write_audit(session, patient_id=patient_id, operation="UploadDocument",
-                                result="classifier_unavailable", document_id=None, latency_ms=elapsed(started))
+                                result="classifier_unavailable", document_id=None, latency_ms=elapsed(started),
+                                reason=_sanitize_provider_reason(str(exc)))
                     return JSONResponse(status_code=503, content={"error": "classifier_unavailable"})
                 document_id = f"DOC-{secrets.token_hex(6).upper()}"
                 object_key = None

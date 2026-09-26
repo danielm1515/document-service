@@ -110,6 +110,20 @@ def test_an_api_error_is_unavailable_not_unparsable():
         classifier.classify("text")
 
 
+def test_a_400_bad_request_is_also_unavailable_not_unparsable():
+    """Review round 1, M4: a model that rejects image input (e.g. OPENAI_MODEL pointed at a
+    non-vision model) answers 400, which is still an openai.OpenAIError subclass - so it is a
+    provider failure (classifier_unavailable), never DOCUMENT_UNREADABLE."""
+    import httpx
+    import openai
+    request = httpx.Request("POST", "https://api.openai.com")
+    response = httpx.Response(400, request=request, json={"error": {"message": "no image support"}})
+    error = openai.BadRequestError("no image support", response=response, body=None)
+    classifier, _ = openai_with(raises=error)
+    with pytest.raises(ClassifierUnavailable):
+        classifier.classify_images([b"\xff\xd8\xff"])
+
+
 def test_openai_classify_images_call_shape():
     """Same prompt contract, same schema, one call - `image_url` data-URL parts in the user
     message instead of the extracted text (Task 2, decision 3)."""
