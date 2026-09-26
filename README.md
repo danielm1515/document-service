@@ -254,12 +254,15 @@ curl -i -X POST \
 
 - `llm_usage: null` - לא בוצעה קריאה: כפילות (`DUPLICATE_DOCUMENT`), או דחייה מוקדמת לפני הסיווג
   (`too_large`, `not_supported_format`, `parse_error`, `too_many_pages`, `too_much_text`, `no_text_layer`).
-- תשובה שהגיעה אך לא הייתה שמישה (`DOCUMENT_UNREADABLE` עם `reason: "classifier_unparsable"`) **נושאת**
-  את ה-`llm_usage` שלה - הטוקנים האלה חויבו.
+- `DOCUMENT_UNREADABLE` עם `reason: "classifier_unparsable"` **נושא את ה-`llm_usage` שלו כשהגיעה
+  תשובה** (שלא הייתה שמישה) - הטוקנים האלה חויבו.
 - `usage` חסר או פגום בתשובת OpenAI (לא מספר שלם, שלילי, או cached גדול מ-input) - שלושת המונים `null`,
   אבל `call` ו-`model` נשארים: קריאה בוצעה, רק הכמות לא ידועה. לעולם לא ניחוש.
-- `503 classifier_unavailable` נשאר `{"error": "classifier_unavailable"}` בלבד - שגיאת API לא מחייבת
-  דבר לדווח עליו. גם שאר תשובות ה-`503` לא השתנו.
+- `503 classifier_unavailable` נשאר `{"error": "classifier_unavailable"}` בלבד - שגיאת API לא נושאת
+  `usage` לדווח עליו. timeout עשוי להיות מחויב אצל הספק, אבל אינו מדווח. גם שאר תשובות ה-`503` לא השתנו.
+- **פער חשבונאי ידוע:** `503` שקורה *אחרי* הקריאה (`storage_unavailable` או `database_unavailable`),
+  או בקשה שנפלה ב-timeout אצל הקורא ונענית אחר כך כ-`DUPLICATE_DOCUMENT` (`llm_usage: null`), משאירים
+  את הטוקנים של אותה קריאה לא מדווחים.
 - המונים מופיעים בתשובה בלבד: לא בשורת ה-log ולא בשורת ה-audit.
 
 **רשימת המסמכים של מטופל:**

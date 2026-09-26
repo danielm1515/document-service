@@ -19,7 +19,7 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from datetime import date
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .catalog import CODES
 from .magic import mime_of
@@ -58,13 +58,16 @@ SCHEMA: dict[str, Any] = {
 }
 
 
+LLMCall = Literal["classify", "vision"]
+
+
 @dataclass(frozen=True)
 class LLMUsage:
     """The token usage of the one classify/vision call behind an answer (Sub-project 19, D1/D5) -
     counts and codes only, never text. `call` is "classify" (extracted text) or "vision" (page
     images). The three counts are all None when the response's `usage` was missing or malformed:
     never a guess, but the call and the model still say that a call was billed."""
-    call: str
+    call: LLMCall
     model: str
     input_tokens: int | None
     cached_input_tokens: int | None
@@ -80,7 +83,7 @@ def _count(value: Any) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
-def _usage_of(response: Any, call: str, model: str) -> LLMUsage:
+def _usage_of(response: Any, call: LLMCall, model: str) -> LLMUsage:
     """Reads `prompt_tokens`, `prompt_tokens_details.cached_tokens` (absent means 0) and
     `completion_tokens`. Anything missing or malformed - a non-int, a negative, cached > prompt -
     gives null counts for all three rather than a partial or guessed figure."""
@@ -187,7 +190,7 @@ class OpenAIClassifier:
             content.append({"type": "image_url", "image_url": {"url": f"data:{mime_of(image)};base64,{b64}"}})
         return self._call("vision", [{"role": "system", "content": PROMPT}, {"role": "user", "content": content}])
 
-    def _call(self, call: str, messages: list[dict[str, Any]]) -> Classification:
+    def _call(self, call: LLMCall, messages: list[dict[str, Any]]) -> Classification:
         """`call` names the usage ("classify" or "vision"). An answer that arrived carries its
         usage whether it was usable or not - an unusable one on its ClassifierFailed."""
         import openai
@@ -233,8 +236,8 @@ class FakeClassifier:
     path end to end)."""
 
     model = "fake"
-    TEXT_USAGE = LLMUsage("classify", "fake", 900, 0, 40)
-    IMAGE_USAGE = LLMUsage("vision", "fake", 1200, 0, 40)
+    TEXT_USAGE = LLMUsage("classify", model, 900, 0, 40)
+    IMAGE_USAGE = LLMUsage("vision", model, 1200, 0, 40)
 
     def classify(self, text: str) -> Classification:
         if not text.strip():
