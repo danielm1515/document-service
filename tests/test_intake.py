@@ -417,6 +417,19 @@ def test_a_genuinely_extreme_jpeg_photo_is_still_refused_as_too_large():
     assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
 
 
+def test_a_very_wide_short_jpeg_is_still_too_large_after_drafting():
+    """Pins the post-draft pixel check itself: draft() only scales by a power of two and keeps
+    the smaller dimension at at least 1600px, so a 20000x1500 photo - already under 1600 on its
+    short side - cannot be scaled down at all (draft leaves it exactly 20000x1500 = 30,000,000
+    pixels, confirmed by hand), and must still be caught by the check that runs *after*
+    draft(), not just by draft() itself."""
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (20000, 1500), color=(1, 2, 3)).save(buffer, format="JPEG", quality=60)
+    outcome = intake(buffer.getvalue())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
+
+
 def test_a_pdf_page_with_only_an_oversized_declared_image_yields_no_text_layer():
     """The garbage 10-byte stream would fail to decode as a 20000x20000 image anyway - this
     proves the rejection happens from the declared size, since app.intake._largest_usable_image_name
