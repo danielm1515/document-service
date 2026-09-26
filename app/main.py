@@ -19,9 +19,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .catalog import BY_CODE
-from .classifier import OpenAIClassifier
+from .classifier import ClassifierUnavailable, OpenAIClassifier
 from .config import Settings
 from .intake import ACCEPTED, DOCUMENT_EXPIRED, DuplicateOf, run_intake
+from .magic import CONTENT_TYPE, EXTENSION, sniff_kind
 from .models import AuditLog, Base, Document
 from .storage import S3ObjectStore, StorageFailed
 
@@ -32,6 +33,14 @@ CLINIC_TZ = ZoneInfo("Asia/Jerusalem")
 PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 FROM_ENV = object()  # "build this port from the environment" (the default for classifier/store)
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
+# ClassifierUnavailable's message is already a fixed code (e.g. "api:RateLimitError"), never
+# document content - this is a second line of defence should some future OpenAIError subclass
+# embed anything freer-form (review I2).
+_UNSAFE_REASON_CHARS = re.compile(r"[^A-Za-z0-9_:]")
+
+
+def _sanitize_provider_reason(raw: str) -> str:
+    return _UNSAFE_REASON_CHARS.sub("", raw)[:80] or "unknown"
 
 
 def _israel_today() -> date:
@@ -97,16 +106,17 @@ class AuthBeforeBodyMiddleware:
 
 
 def write_audit(session: Session, *, patient_id: str, operation: str, result: str,
-                document_id: str | None, latency_ms: int) -> None:
+                document_id: str | None, latency_ms: int, reason: str | None = None) -> None:
     """Adds the audit row and commits it with whatever else is pending, then logs - only once the
     row is actually durable (minor: log line after commit; a failed commit is never misreported
     as done). The log line carries no patient_id (it is in the audit table, which is
-    access-controlled)."""
+    access-controlled). `reason` is a fixed code, never document content - null unless the
+    intake set one (Task 2, decision 2)."""
     session.add(AuditLog(audit_id=str(uuid4()), patient_id=patient_id, operation=operation, result=result,
                          document_id=document_id, latency_ms=latency_ms))
     session.commit()
     logger.info(json.dumps({"operation": operation, "result": result, "document_id": document_id,
-                            "latency_ms": latency_ms}))
+                            "reason": reason, "latency_ms": latency_ms}))
 
 
 def create_app(database_url: str | None = None, *, api_key: str | None = None,
@@ -191,7 +201,7 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
     @app.post("/api/v1/patients/{patient_id}/documents", status_code=201, tags=["Documents"])
     def upload_document(request: Request, patient_id: str = ApiPath(pattern=PATIENT_ID_PATTERN),
                         file: UploadFile = File(...)) -> JSONResponse:
-        """Checks and classifies one PDF; stores it only if accepted (design §4.2)."""
+        """Checks and classifies one PDF, JPEG or PNG; stores it only if accepted (design §4.2)."""
         if not authorised(request):
             return unauthorised()
         state = request.app.state
@@ -213,14 +223,25 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
                         Document.result == ACCEPTED).limit(1)).first()
                     return DuplicateOf(row.document_id, row.document_type, row.document_date) if row else None
 
-                outcome = run_intake(data, patient_id, classifier=state.classifier, today=state.today(),
-                                     is_duplicate=accepted_duplicate, max_bytes=limit)
+                try:
+                    outcome = run_intake(data, patient_id, classifier=state.classifier, today=state.today(),
+                                         is_duplicate=accepted_duplicate, max_bytes=limit)
+                except ClassifierUnavailable as exc:
+                    # A provider failure is never a verdict on the file (Task 2, decision 1) - the
+                    # same pattern as storage_unavailable below: an audit row, no Document row.
+                    # The provider code (e.g. "api:RateLimitError") is kept, not just the fact of
+                    # failure (review I2) - sanitised, since it is logged.
+                    write_audit(session, patient_id=patient_id, operation="UploadDocument",
+                                result="classifier_unavailable", document_id=None, latency_ms=elapsed(started),
+                                reason=_sanitize_provider_reason(str(exc)))
+                    return JSONResponse(status_code=503, content={"error": "classifier_unavailable"})
                 document_id = f"DOC-{secrets.token_hex(6).upper()}"
                 object_key = None
                 if outcome.result == ACCEPTED:
-                    object_key = f"patients/{patient_id}/{document_id}.pdf"
+                    kind = sniff_kind(data) or "pdf"
+                    object_key = f"patients/{patient_id}/{document_id}.{EXTENSION[kind]}"
                     try:
-                        state.store.put(object_key, data)
+                        state.store.put(object_key, data, content_type=CONTENT_TYPE[kind])
                     except StorageFailed:
                         write_audit(session, patient_id=patient_id, operation="UploadDocument",
                                     result="storage_unavailable", document_id=None, latency_ms=elapsed(started))
@@ -230,7 +251,7 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
                                      result=outcome.result, sha256=outcome.sha256, size_bytes=outcome.size_bytes,
                                      s3_object_key=object_key, uploaded_at=_utc_now()))
                 write_audit(session, patient_id=patient_id, operation="UploadDocument", result=outcome.result,
-                            document_id=document_id, latency_ms=elapsed(started))
+                            document_id=document_id, latency_ms=elapsed(started), reason=outcome.reason)
             except SQLAlchemyError:
                 session.rollback()
                 # If `object_key` was already set, the object is already in S3 and now orphaned:
@@ -240,7 +261,7 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
         content = {
             "document_id": document_id, "document_type": outcome.document_type,
             "document_date": outcome.document_date.isoformat() if outcome.document_date else None,
-            "result": outcome.result}
+            "result": outcome.result, "reason": outcome.reason}
         if outcome.duplicate_of:
             content["duplicate_of"] = outcome.duplicate_of
         return JSONResponse(status_code=201, content=content)
