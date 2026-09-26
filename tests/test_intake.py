@@ -366,17 +366,55 @@ def _pdf_with_an_oversized_declared_image() -> bytes:
     return buffer.getvalue()
 
 
-def test_a_standalone_image_declaring_a_huge_size_is_refused_quickly_as_parse_error():
+def test_a_standalone_image_declaring_a_huge_size_is_refused_quickly_as_too_large():
+    """Review round 2, N1: a pixel-count refusal is reported as `too_large`, not the generic
+    `parse_error` - distinguishing "too big" from "corrupt"."""
     outcome = intake(_png_declaring_huge_dimensions())
-    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "parse_error"
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
 
 
-def test_a_standalone_image_in_the_warn_only_band_is_still_refused():
+def test_a_standalone_image_in_the_warn_only_band_is_still_refused_as_too_large():
     """36,000,000 declared pixels - above MAX_DECLARED_PIXELS (25M) but below Pillow's own
     default hard-error threshold (2x its MAX_IMAGE_PIXELS), so Pillow would only warn unless the
     warning is escalated to an error inside _downscale."""
     outcome = intake(_png_declaring_huge_dimensions(6000, 6000))
-    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "parse_error"
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
+
+
+# --- Review round 2, N1: a real 48-50MP phone photo is a legitimate JPEG upload and must not be
+# refused just for its declared size - a JPEG's own draft() decodes at a bounded scale regardless
+# of the file's resolution, so the pixel bound applies to the drafted size, not the declared one.
+# A PNG has no draft scaling and stays on the ordinary (declared-size) path - still `too_large`,
+# now correctly distinguished from a decode failure, but not accepted the way a JPEG photo is. ---
+
+def test_a_48_megapixel_jpeg_photo_is_accepted_and_downscaled_to_at_most_1600():
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (8000, 6000), color=(10, 20, 30)).save(buffer, format="JPEG", quality=70)
+    spy = Spy()
+    outcome = intake(buffer.getvalue(), classifier=spy)
+    assert outcome.result == ACCEPTED and outcome.reason is None
+    [sent] = spy.images
+    width, height = Image.open(io.BytesIO(sent)).size
+    assert max(width, height) <= 1600
+
+
+def test_a_48_megapixel_png_is_too_large():
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (8000, 6000), color=(10, 20, 30)).save(buffer, format="PNG")
+    outcome = intake(buffer.getvalue())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
+
+
+def test_a_genuinely_extreme_jpeg_photo_is_still_refused_as_too_large():
+    """144,000,000 pixels - over Pillow's own hard error threshold (2x MAX_IMAGE_PIXELS) even
+    before draft() gets a chance to run; still `too_large`, not `parse_error`."""
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (12000, 12000), color=(3, 4, 5)).save(buffer, format="JPEG", quality=60)
+    outcome = intake(buffer.getvalue())
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "too_large"
 
 
 def test_a_pdf_page_with_only_an_oversized_declared_image_yields_no_text_layer():
@@ -485,6 +523,77 @@ def test_the_largest_image_on_a_page_is_the_one_sent():
     writer.write(buffer)
     reader = pypdf.PdfReader(io.BytesIO(buffer.getvalue()))
     assert _largest_usable_image_name(reader.pages[0]) == "/Big"
+
+
+# --- Review round 2, M-A: a scan wrapped in a Form XObject (common when a PDF page is built from
+# a reusable "stamp" object) must still be found - page.images.keys() already walks into a Form's
+# own /Resources and returns a nested path like ['/Fm0', '/Im0']; _declared_size must walk the
+# same path to read the actual image dictionary's /Width//Height. ---
+
+def _scanned_pdf_in_form_xobject(size: tuple[int, int] = (800, 600)) -> bytes:
+    import pypdf
+    from pypdf.generic import ArrayObject, ContentStream, DictionaryObject, FloatObject, NameObject, StreamObject
+
+    width, height = size
+    img_bytes = _solid_image("JPEG", size)
+
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=width, height=height)
+
+    img_xobj = StreamObject()
+    img_xobj.set_data(img_bytes)
+    img_xobj[NameObject("/Type")] = NameObject("/XObject")
+    img_xobj[NameObject("/Subtype")] = NameObject("/Image")
+    img_xobj[NameObject("/Width")] = pypdf.generic.NumberObject(width)
+    img_xobj[NameObject("/Height")] = pypdf.generic.NumberObject(height)
+    img_xobj[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    img_xobj[NameObject("/BitsPerComponent")] = pypdf.generic.NumberObject(8)
+    img_xobj[NameObject("/Filter")] = NameObject("/DCTDecode")
+    img_ref = writer._add_object(img_xobj)
+
+    form_resources = DictionaryObject()
+    form_xobjects = DictionaryObject()
+    form_xobjects[NameObject("/Im0")] = img_ref
+    form_resources[NameObject("/XObject")] = form_xobjects
+
+    form_xobj = StreamObject()
+    form_xobj.set_data(f"q {width} 0 0 {height} 0 0 cm /Im0 Do Q".encode())
+    form_xobj[NameObject("/Type")] = NameObject("/XObject")
+    form_xobj[NameObject("/Subtype")] = NameObject("/Form")
+    form_xobj[NameObject("/BBox")] = ArrayObject(
+        [FloatObject(0), FloatObject(0), FloatObject(width), FloatObject(height)])
+    form_xobj[NameObject("/Resources")] = form_resources
+    form_ref = writer._add_object(form_xobj)
+
+    page_resources = DictionaryObject()
+    page_xobjects = DictionaryObject()
+    page_xobjects[NameObject("/Fm0")] = form_ref
+    page_resources[NameObject("/XObject")] = page_xobjects
+    page[NameObject("/Resources")] = page_resources
+
+    content = ContentStream(None, writer)
+    content.set_data(b"q 1 0 0 1 0 0 cm /Fm0 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(content)
+
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_a_scan_wrapped_in_a_form_xobject_is_found_and_has_no_text_layer():
+    import pypdf
+    from app.intake import _largest_usable_image_name
+    reader = pypdf.PdfReader(io.BytesIO(_scanned_pdf_in_form_xobject()))
+    page = reader.pages[0]
+    assert list(page.images.keys()) == [["/Fm0", "/Im0"]]
+    assert _largest_usable_image_name(page) == ["/Fm0", "/Im0"]
+
+
+def test_a_scan_wrapped_in_a_form_xobject_is_classified_through_vision():
+    spy = Spy()
+    outcome = intake(_scanned_pdf_in_form_xobject(), classifier=spy)
+    assert outcome.result == ACCEPTED and outcome.reason is None
+    assert spy.images is not None and len(spy.images) == 1
 
 
 # --- Review round 1, M5: too little extracted text (under 40 non-space characters) takes the

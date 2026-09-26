@@ -108,70 +108,135 @@ def _text_of(data: bytes) -> str:
         raise _TextExtractionFailed("parse_error") from None
 
 
-def _downscale(data: bytes) -> bytes | None:
+class _ImageTooLarge(Exception):
+    """Raised by _downscale whenever a refusal is specifically about pixel count - the file's own
+    declared size (a PNG, or a JPEG that fails Pillow's decompression-bomb check outright), or,
+    for a standalone JPEG photo (`standalone_jpeg_photo=True`, review N1), the *drafted* size.
+    Distinguished from an ordinary decode failure (a corrupt or unsupported image) so a caller
+    that reports a reason to the patient can say `too_large` instead of the generic
+    `parse_error`. `_page_images` (an embedded PDF page image) still treats this exactly like any
+    other failure - that page simply contributes nothing - since the whole-document reason there
+    stays `no_text_layer`, never a per-page code."""
+
+
+def _finish_downscale(image: Image.Image) -> bytes:
+    """The tail shared by both _downscale paths: EXIF orientation applied then stripped (the
+    final save never re-attaches it - review I1), converted to RGB, resized to at most
+    MAX_IMAGE_DIMENSION on the long side, re-encoded as JPEG."""
+    image = ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
+    width, height = image.size
+    longest = max(width, height)
+    if longest > MAX_IMAGE_DIMENSION:
+        scale = MAX_IMAGE_DIMENSION / longest
+        image = image.resize((max(1, round(width * scale)), max(1, round(height * scale))))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
+def _downscale(data: bytes, *, standalone_jpeg_photo: bool = False) -> bytes | None:
     """Re-encodes one image - a standalone upload or an embedded PDF page image - as a JPEG no
-    larger than MAX_IMAGE_DIMENSION on its long side, EXIF orientation applied and EXIF itself
-    stripped by the re-encode (review I1). `None` for anything Pillow cannot make sense of, or
-    that is a decompression-bomb risk (review I3): `Image.open` reports pixel dimensions before
-    any pixel is decoded, so an over-declared image is rejected there, and a Pillow
-    DecompressionBombWarning (a size Pillow would otherwise only warn about) is escalated to an
-    exception for this call. A corrupt, hostile or oversized image is simply skipped, never a
-    crash and never unbounded work."""
+    larger than MAX_IMAGE_DIMENSION on its long side (review I1). `None` for anything Pillow
+    cannot make sense of; `_ImageTooLarge` specifically for a pixel-count refusal (review N1) -
+    for a PNG or an embedded PDF image, that is a decompression-bomb risk (review I3):
+    `Image.open` reports pixel dimensions before any pixel is decoded, so an over-declared image
+    is rejected there, and a Pillow DecompressionBombWarning (a size Pillow would otherwise only
+    warn about) is escalated to an exception for this call - both that escalated warning and
+    Pillow's own harder DecompressionBombError (over twice Image.MAX_IMAGE_PIXELS) are converted
+    to `_ImageTooLarge`, since either way the refusal is about size, not corruption.
+
+    `standalone_jpeg_photo=True` (review N1) is the one exception, for a standalone JPEG upload
+    only: a modern phone photo is legitimately 48-50 megapixels, well over MAX_DECLARED_PIXELS,
+    but a JPEG's own `draft()` decodes directly at a reduced scale (libjpeg's own IDCT scaling -
+    a real memory bound, not a resize after a full decode), so here the pixel bound is checked
+    against the *drafted* size instead of the file's declared size, and the warn-only band is
+    deliberately not escalated - only Pillow's hard error above twice MAX_IMAGE_PIXELS, or the
+    post-draft bound, can still refuse it, and both still raise `_ImageTooLarge`."""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as image:
-                width, height = image.size  # header only - no pixel has been decoded yet
-                if width * height > MAX_DECLARED_PIXELS:
-                    return None
-                if image.format == "JPEG":
-                    # Lets libjpeg decode directly at roughly the target size instead of full
-                    # resolution - a no-op for any other format (Pillow's base Image.draft).
+        if standalone_jpeg_photo:
+            try:
+                with Image.open(io.BytesIO(data)) as image:
                     image.draft("RGB", (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
-                image = ImageOps.exif_transpose(image)
-                image = image.convert("RGB")
-                width, height = image.size
-                longest = max(width, height)
-                if longest > MAX_IMAGE_DIMENSION:
-                    scale = MAX_IMAGE_DIMENSION / longest
-                    image = image.resize((max(1, round(width * scale)), max(1, round(height * scale))))
-                out = io.BytesIO()
-                image.save(out, format="JPEG", quality=85)
-                return out.getvalue()
-    except Exception:
-        return None
-
-
-def _largest_usable_image_name(page: pypdf.PageObject) -> str | None:
-    """The resource name (e.g. `/Im0`) of the largest embedded image on this page worth sending to
-    vision - not a tiny icon or logo (review M1), not so large its *declared* pixel count alone is
-    a decompression-bomb risk (review I3). Reads only the page's `/Resources -> /XObject`
-    dictionary's declared `/Width`/`/Height` - never decodes a single pixel, so an oversized
-    candidate is skipped without ever being opened. `None` if the page has no usable image."""
-    try:
-        resources = page.get("/Resources")
-        xobjects = resources.get("/XObject") if resources else None
-    except Exception:
-        return None
-    if not xobjects:
-        return None
-    best_name, best_area = None, 0
-    for name in xobjects:
+                    width, height = image.size
+                    if width * height > MAX_DECLARED_PIXELS:
+                        raise _ImageTooLarge()
+                    return _finish_downscale(image)
+            except Image.DecompressionBombError:
+                raise _ImageTooLarge() from None
         try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(data)) as image:
+                    width, height = image.size  # header only - no pixel has been decoded yet
+                    if width * height > MAX_DECLARED_PIXELS:
+                        raise _ImageTooLarge()
+                    if image.format == "JPEG":
+                        # Lets libjpeg decode directly at roughly the target size instead of
+                        # full resolution - a no-op for any other format (Image.draft's base).
+                        image.draft("RGB", (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+                    return _finish_downscale(image)
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+            # Pillow's own MAX_IMAGE_PIXELS-driven check already fired inside Image.open() -
+            # before the explicit check above was ever reached - for anything past its own
+            # threshold; either way this is a size refusal, not a decode failure.
+            raise _ImageTooLarge() from None
+    except _ImageTooLarge:
+        raise
+    except Exception:
+        return None
+
+
+def _declared_size(page: pypdf.PageObject, path: str | list) -> tuple[int, int] | None:
+    """The declared (undecoded) pixel dimensions of one entry from `page.images.keys()` - a bare
+    resource name for a top-level image, or a list of names walking down through one or more Form
+    XObjects to the actual image dictionary (review M-A: `page.images.keys()` already returns
+    such nested paths for a scan wrapped in a Form XObject, e.g. `['/Fm0', '/Im0']`). Reads only
+    dictionaries - `/Subtype`, `/Width`, `/Height`, and each Form's own `/Resources` to descend
+    into - never a pixel."""
+    try:
+        names = [path] if isinstance(path, str) else list(path)
+        resources = page.get("/Resources")
+        xobj = None
+        for name in names:
+            xobjects = resources.get("/XObject") if resources else None
+            if not xobjects or name not in xobjects:
+                return None
             xobj = xobjects[name]
-            if xobj.get("/Subtype") != "/Image":
-                continue
-            width, height = int(xobj.get("/Width", 0)), int(xobj.get("/Height", 0))
-        except Exception:
+            if xobj.get("/Subtype") == "/Form":
+                resources = xobj.get("/Resources")
+        if xobj is None or xobj.get("/Subtype") != "/Image":
+            return None
+        return int(xobj.get("/Width", 0)), int(xobj.get("/Height", 0))
+    except Exception:
+        return None
+
+
+def _largest_usable_image_name(page: pypdf.PageObject):
+    """The `page.images` key of the largest embedded image on this page worth sending to vision -
+    not a tiny icon or logo (review M1), not so large its *declared* pixel count alone is a
+    decompression-bomb risk (review I3), and found even when it is nested inside a Form XObject
+    (review M-A). `page.images.keys()` already walks Form XObjects to find every image path;
+    `_declared_size` reads each one's dictionary without decoding. `None` if the page has no
+    usable image."""
+    try:
+        paths = list(page.images.keys())
+    except Exception:
+        return None
+    best_path, best_area = None, 0
+    for path in paths:
+        size = _declared_size(page, path)
+        if size is None:
             continue
+        width, height = size
         if width < MIN_IMAGE_DIMENSION and height < MIN_IMAGE_DIMENSION:
             continue  # an icon or a logo, not a page scan
         area = width * height
         if area == 0 or area > MAX_DECLARED_PIXELS:
             continue
         if area > best_area:
-            best_name, best_area = name, area
-    return best_name
+            best_path, best_area = path, area
+    return best_path
 
 
 def _page_images(data: bytes) -> list[bytes]:
@@ -188,14 +253,17 @@ def _page_images(data: bytes) -> list[bytes]:
     for page in reader.pages:
         if len(images) >= MAX_IMAGES:
             break
-        name = _largest_usable_image_name(page)
-        if name is None:
+        path = _largest_usable_image_name(page)
+        if path is None:
             continue
         try:
-            raw = page.images[name].data
+            raw = page.images[path].data
         except Exception:
             continue
-        downscaled = _downscale(raw)
+        try:
+            downscaled = _downscale(raw)
+        except _ImageTooLarge:
+            continue  # this page contributes nothing - no per-page reason surfaces (M1)
         if downscaled is not None:
             images.append(downscaled)
     return images
@@ -222,7 +290,13 @@ def run_intake(data: bytes, patient_id: str, *, classifier: Classifier, today: d
     text: str | None = None
     images: list[bytes] | None = None
     if kind in ("jpeg", "png"):
-        downscaled = _downscale(data)
+        try:
+            # A standalone JPEG gets the draft-scaled path (review N1): a 48-50MP phone photo is
+            # legitimate and must not be refused just for its declared size. PNG has no draft
+            # scaling, so it stays on the ordinary path, unaffected by this review round.
+            downscaled = _downscale(data, standalone_jpeg_photo=(kind == "jpeg"))
+        except _ImageTooLarge:
+            return outcome(DOCUMENT_UNREADABLE, reason="too_large")
         if downscaled is None:
             return outcome(DOCUMENT_UNREADABLE, reason="parse_error")
         images = [downscaled]
