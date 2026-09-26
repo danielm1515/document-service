@@ -219,7 +219,9 @@ curl -i -X POST \
 
 ```json
 {"document_id": "DOC-3F2A1B9C0D4E", "document_type": "CBC", "document_date": "2026-09-15",
- "result": "ACCEPTED", "reason": null}
+ "result": "ACCEPTED", "reason": null,
+ "llm_usage": {"call": "classify", "model": "gpt-5.6-luna", "input_tokens": 1234,
+               "cached_input_tokens": 1024, "output_tokens": 38}}
 ```
 
 `reason` הוא תוספת: `null` על `ACCEPTED` (וגם על `DUPLICATE_DOCUMENT`/`NON_MEDICAL_DOCUMENT`/
@@ -227,7 +229,7 @@ curl -i -X POST \
 
 ```json
 {"document_id": "DOC-7A1B2C3D4E5F", "document_type": null, "document_date": null,
- "result": "DOCUMENT_UNREADABLE", "reason": "no_text_layer"}
+ "result": "DOCUMENT_UNREADABLE", "reason": "no_text_layer", "llm_usage": null}
 ```
 
 אם התוצאה `DUPLICATE_DOCUMENT`, התשובה כוללת גם `duplicate_of` - ו-`document_type`/`document_date`
@@ -235,8 +237,30 @@ curl -i -X POST \
 
 ```json
 {"document_id": "DOC-9B1C2D3E4F5A", "document_type": "CBC", "document_date": "2026-09-15",
- "result": "DUPLICATE_DOCUMENT", "reason": null, "duplicate_of": "DOC-3F2A1B9C0D4E"}
+ "result": "DUPLICATE_DOCUMENT", "reason": null, "duplicate_of": "DOC-3F2A1B9C0D4E", "llm_usage": null}
 ```
+
+`llm_usage` (תת-פרויקט 19) נמצא בכל תשובת `201`: צריכת הטוקנים של קריאת ה-LLM היחידה של ההעלאה,
+כדי ש-hospital-agent יוכל לחשב את עלותה ולשייך אותה לפנייה. זו תוספת - קורא שמתעלם ממפתחות לא מוכרים
+לא מושפע.
+
+| שדה | משמעות |
+|---|---|
+| `call` | `"classify"` (טקסט שחולץ מ-PDF) או `"vision"` (תמונה, או PDF סרוק שנשלח כתמונות עמוד) |
+| `model` | המודל שנקרא (`OPENAI_MODEL`; `"fake"` ב-`FakeClassifier` של הבדיקות) |
+| `input_tokens` | `usage.prompt_tokens` של תשובת OpenAI |
+| `cached_input_tokens` | `usage.prompt_tokens_details.cached_tokens` (חסר = `0`); חלק מ-`input_tokens`, לא בנוסף לו |
+| `output_tokens` | `usage.completion_tokens` |
+
+- `llm_usage: null` - לא בוצעה קריאה: כפילות (`DUPLICATE_DOCUMENT`), או דחייה מוקדמת לפני הסיווג
+  (`too_large`, `not_supported_format`, `parse_error`, `too_many_pages`, `too_much_text`, `no_text_layer`).
+- תשובה שהגיעה אך לא הייתה שמישה (`DOCUMENT_UNREADABLE` עם `reason: "classifier_unparsable"`) **נושאת**
+  את ה-`llm_usage` שלה - הטוקנים האלה חויבו.
+- `usage` חסר או פגום בתשובת OpenAI (לא מספר שלם, שלילי, או cached גדול מ-input) - שלושת המונים `null`,
+  אבל `call` ו-`model` נשארים: קריאה בוצעה, רק הכמות לא ידועה. לעולם לא ניחוש.
+- `503 classifier_unavailable` נשאר `{"error": "classifier_unavailable"}` בלבד - שגיאת API לא מחייבת
+  דבר לדווח עליו. גם שאר תשובות ה-`503` לא השתנו.
+- המונים מופיעים בתשובה בלבד: לא בשורת ה-log ולא בשורת ה-audit.
 
 **רשימת המסמכים של מטופל:**
 
