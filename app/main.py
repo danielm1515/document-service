@@ -261,7 +261,10 @@ def create_app(database_url: str | None = None, *, api_key: str | None = None,
         content = {
             "document_id": document_id, "document_type": outcome.document_type,
             "document_date": outcome.document_date.isoformat() if outcome.document_date else None,
-            "result": outcome.result, "reason": outcome.reason}
+            "result": outcome.result, "reason": outcome.reason,
+            # Sub-project 19: the one classify/vision call's tokens, null when none was made.
+            # In the answer only - never in the log line or the audit row.
+            "llm_usage": outcome.llm_usage.as_json() if outcome.llm_usage is not None else None}
         if outcome.duplicate_of:
             content["duplicate_of"] = outcome.duplicate_of
         return JSONResponse(status_code=201, content=content)

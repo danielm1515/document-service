@@ -13,7 +13,7 @@ import pypdf
 from PIL import Image, ImageOps
 
 from .catalog import BY_CODE
-from .classifier import Classifier, ClassifierFailed
+from .classifier import Classifier, ClassifierFailed, LLMUsage
 from .magic import sniff_kind
 
 # A firm ceiling on decoded pixel count (review I3): Pillow's own default (~89M) only warns below
@@ -76,6 +76,9 @@ class IntakeOutcome:
     # A fixed code at every refusal (never set for ACCEPTED or DUPLICATE_DOCUMENT). Logged and
     # returned additively in the 201 body - never document content.
     reason: str | None = None
+    # The usage of the one classify/vision call (Sub-project 19), None when the intake decided
+    # before any call - an early rejection or a duplicate. Returned in the 201 body, never logged.
+    llm_usage: LLMUsage | None = None
 
 
 class _TextExtractionFailed(Exception):
@@ -272,10 +275,13 @@ def _page_images(data: bytes) -> list[bytes]:
 def run_intake(data: bytes, patient_id: str, *, classifier: Classifier, today: date,
                is_duplicate: Callable[[str], DuplicateOf | None], max_bytes: int) -> IntakeOutcome:
     sha = hashlib.sha256(data).hexdigest()
+    # Set once, at step 5, from the call's answer (or its ClassifierFailed); every outcome built
+    # after that carries it, every one before it (no call made) carries None.
+    usage: LLMUsage | None = None
 
     def outcome(result: str, doc_type: str | None = None, doc_date: date | None = None,
                duplicate_of: str | None = None, reason: str | None = None) -> IntakeOutcome:
-        return IntakeOutcome(result, doc_type, doc_date, sha, len(data), duplicate_of, reason)
+        return IntakeOutcome(result, doc_type, doc_date, sha, len(data), duplicate_of, reason, usage)
 
     # 1. size
     if len(data) > max_bytes:
@@ -320,8 +326,10 @@ def run_intake(data: bytes, patient_id: str, *, classifier: Classifier, today: d
     # a verdict on the file, and propagates to the caller (app/main.py: 503 classifier_unavailable).
     try:
         found = classifier.classify(text) if text is not None else classifier.classify_images(images)
-    except ClassifierFailed:
+    except ClassifierFailed as exc:
+        usage = exc.usage  # an unusable answer that arrived was still billed
         return outcome(DOCUMENT_UNREADABLE, reason="classifier_unparsable")
+    usage = found.usage
     if not found.is_medical:
         return outcome(NON_MEDICAL_DOCUMENT, None, found.document_date)
     doc_type = BY_CODE.get(found.document_type or "")

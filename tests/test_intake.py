@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.classifier import Classification, ClassifierFailed, ClassifierUnavailable, FakeClassifier
+from app.classifier import Classification, ClassifierFailed, ClassifierUnavailable, FakeClassifier, LLMUsage
 from app.intake import (ACCEPTED, DOCUMENT_EXPIRED, DOCUMENT_UNREADABLE, DUPLICATE_DOCUMENT, NON_MEDICAL_DOCUMENT,
                         PATIENT_MISMATCH, DuplicateOf, run_intake)
 
@@ -637,3 +637,57 @@ def test_a_short_watermark_of_a_text_layer_still_takes_the_vision_path(monkeypat
     outcome = intake(b"%PDF-fake", classifier=spy)
     assert outcome.result == ACCEPTED
     assert spy.images == [b"fake-page-image"]
+
+
+# --- Sub-project 19 (design D5): the outcome carries the usage of the one call, or None when the
+# intake decided before any call (an early rejection, a duplicate). ---
+
+USAGE = LLMUsage("classify", "gpt-5.6-luna", 1234, 1000, 56)
+
+
+def test_a_text_upload_outcome_carries_the_classify_usage():
+    outcome = intake(data("2026", "cbc"))
+    assert outcome.result == ACCEPTED
+    assert outcome.llm_usage == FakeClassifier().classify(" ספירת דם").usage
+    assert outcome.llm_usage.call == "classify"
+
+
+def test_an_image_upload_outcome_carries_the_vision_usage():
+    outcome = intake(_solid_image("PNG"))
+    assert outcome.result == ACCEPTED and outcome.llm_usage.call == "vision"
+
+
+def test_a_scanned_pdf_outcome_carries_the_vision_usage():
+    assert intake(_scanned_pdf()).llm_usage.call == "vision"
+
+
+@pytest.mark.parametrize("answer", [
+    Classification(False, None, date(2026, 9, 1), None, usage=USAGE),                # NON_MEDICAL_DOCUMENT
+    Classification(True, None, date(2026, 9, 1), None, usage=USAGE),                 # unknown_type
+    Classification(True, "CBC", date(2026, 9, 1), "P-20000", usage=USAGE),           # PATIENT_MISMATCH
+    Classification(True, "CBC", None, None, usage=USAGE),                           # no_date
+    Classification(True, "CBC", date(2026, 9, 23), None, usage=USAGE),              # future_date
+    Classification(True, "CBC", date(2020, 1, 1), None, usage=USAGE),               # too_old
+    Classification(True, "CBC", date(2026, 9, 1), None, usage=USAGE),               # ACCEPTED
+])
+def test_every_outcome_after_the_call_carries_its_usage(answer):
+    assert intake(data("2026", "cbc"), classifier=Scripted(answer)).llm_usage == USAGE
+
+
+def test_an_unparsable_answer_keeps_its_usage():
+    outcome = intake(data("2026", "cbc"), classifier=Scripted(ClassifierFailed("unparsable", usage=USAGE)))
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.reason == "classifier_unparsable"
+    assert outcome.llm_usage == USAGE
+
+
+def test_a_duplicate_made_no_call_and_has_no_usage():
+    raw = data("2026", "cbc")
+    sha = intake(raw).sha256
+    outcome = intake(raw, duplicates={sha: DuplicateOf("DOC-ORIGINAL1", "CBC", date(2026, 9, 15))})
+    assert outcome.result == DUPLICATE_DOCUMENT and outcome.llm_usage is None
+
+
+@pytest.mark.parametrize("raw", [b"GIF89a not supported", b"%PDF-broken", b"x" * (MAX + 1)])
+def test_an_early_rejection_made_no_call_and_has_no_usage(raw):
+    outcome = intake(raw)
+    assert outcome.result == DOCUMENT_UNREADABLE and outcome.llm_usage is None

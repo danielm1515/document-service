@@ -8,15 +8,18 @@ Any unusable answer raises ClassifierFailed, which the intake turns into DOCUMEN
 (fail closed, reason `classifier_unparsable`). A provider failure (rate limit, quota, timeout,
 connection, auth - anything the SDK raises as an `OpenAIError`) is not a verdict on the file: it
 raises ClassifierUnavailable instead, which `app/main.py` turns into `503 classifier_unavailable`,
-the same pattern as a storage failure."""
+the same pattern as a storage failure.
+
+Every answer that arrived carries the call's token usage (`LLMUsage`, Sub-project 19) - on the
+Classification, or on the ClassifierFailed of an unusable answer. A provider failure carries none."""
 from __future__ import annotations
 
 import base64
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import date
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .catalog import CODES
 from .magic import mime_of
@@ -55,13 +58,66 @@ SCHEMA: dict[str, Any] = {
 }
 
 
+LLMCall = Literal["classify", "vision"]
+
+
+@dataclass(frozen=True)
+class LLMUsage:
+    """The token usage of the one classify/vision call behind an answer (Sub-project 19, D1/D5) -
+    counts and codes only, never text. `call` is "classify" (extracted text) or "vision" (page
+    images). The three counts are all None when the response's `usage` was missing or malformed:
+    never a guess, but the call and the model still say that a call was billed."""
+    call: LLMCall
+    model: str
+    input_tokens: int | None
+    cached_input_tokens: int | None
+    output_tokens: int | None
+
+    def as_json(self) -> dict[str, Any]:
+        return {"call": self.call, "model": self.model, "input_tokens": self.input_tokens,
+                "cached_input_tokens": self.cached_input_tokens, "output_tokens": self.output_tokens}
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative int, or None (a bool is not a count)."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _usage_of(response: Any, call: LLMCall, model: str) -> LLMUsage:
+    """Reads `prompt_tokens`, `prompt_tokens_details.cached_tokens` (absent means 0) and
+    `completion_tokens`. Anything missing or malformed - a non-int, a negative, cached > prompt -
+    gives null counts for all three rather than a partial or guessed figure."""
+    none = LLMUsage(call, model, None, None, None)
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return none
+        prompt = _count(getattr(usage, "prompt_tokens", None))
+        completion = _count(getattr(usage, "completion_tokens", None))
+        details = getattr(usage, "prompt_tokens_details", None)
+        raw_cached = getattr(details, "cached_tokens", None) if details is not None else None
+        cached = 0 if raw_cached is None else _count(raw_cached)
+    except Exception:  # an odd response object is bookkeeping's problem, never the upload's
+        return none
+    if prompt is None or completion is None or cached is None or cached > prompt:
+        return none
+    return LLMUsage(call, model, prompt, cached, completion)
+
+
 class ClassifierFailed(Exception):
-    """No usable classification. The reason is a code, never the document's text."""
+    """No usable classification. The reason is a code, never the document's text. `usage` is the
+    usage of an answer that arrived but could not be used (those tokens were billed); None when
+    no answer arrived."""
+
+    def __init__(self, reason: str, *, usage: LLMUsage | None = None) -> None:
+        super().__init__(reason)
+        self.usage = usage
 
 
 class ClassifierUnavailable(Exception):
     """The provider itself failed (rate limit, quota, timeout, connection, auth - `api:<type>`).
-    Never a verdict on the file: the caller must not treat this as DOCUMENT_UNREADABLE."""
+    Never a verdict on the file: the caller must not treat this as DOCUMENT_UNREADABLE. Carries no
+    usage - an API error bills nothing to report."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +126,9 @@ class Classification:
     document_type: str | None
     document_date: date | None
     patient_identifier: str | None
+    # The usage of the call that produced this answer (Sub-project 19). Bookkeeping, not part of
+    # the verdict, so it takes no part in equality.
+    usage: LLMUsage | None = field(default=None, compare=False)
 
 
 class Classifier(Protocol):
@@ -117,8 +176,8 @@ class OpenAIClassifier:
         return self._client
 
     def classify(self, text: str) -> Classification:
-        return self._call([{"role": "system", "content": PROMPT},
-                           {"role": "user", "content": text[:MAX_TEXT_CHARS]}])
+        return self._call("classify", [{"role": "system", "content": PROMPT},
+                                       {"role": "user", "content": text[:MAX_TEXT_CHARS]}])
 
     def classify_images(self, images: list[bytes]) -> Classification:
         """Sends up to MAX_IMAGES page images as `image_url` data-URL parts, same prompt contract,
@@ -129,11 +188,14 @@ class OpenAIClassifier:
         for image in images[:MAX_IMAGES]:
             b64 = base64.b64encode(image).decode("ascii")
             content.append({"type": "image_url", "image_url": {"url": f"data:{mime_of(image)};base64,{b64}"}})
-        return self._call([{"role": "system", "content": PROMPT}, {"role": "user", "content": content}])
+        return self._call("vision", [{"role": "system", "content": PROMPT}, {"role": "user", "content": content}])
 
-    def _call(self, messages: list[dict[str, Any]]) -> Classification:
+    def _call(self, call: LLMCall, messages: list[dict[str, Any]]) -> Classification:
+        """`call` names the usage ("classify" or "vision"). An answer that arrived carries its
+        usage whether it was usable or not - an unusable one on its ClassifierFailed."""
         import openai
 
+        response = None
         try:
             response = self._openai().chat.completions.create(
                 model=self.model,
@@ -146,8 +208,14 @@ class OpenAIClassifier:
         except openai.OpenAIError as exc:
             raise ClassifierUnavailable(f"api:{type(exc).__name__}") from None
         except (json.JSONDecodeError, TypeError, IndexError, AttributeError):
-            raise ClassifierFailed("unparsable") from None
-        return _parse(data)
+            usage = _usage_of(response, call, self.model) if response is not None else None
+            raise ClassifierFailed("unparsable", usage=usage) from None
+        usage = _usage_of(response, call, self.model)
+        try:
+            found = _parse(data)
+        except ClassifierFailed as exc:
+            raise ClassifierFailed(str(exc), usage=usage) from None
+        return replace(found, usage=usage)
 
 
 # The fake: deterministic keyword rules over the demo files' Hebrew. Order matters - a
@@ -163,7 +231,13 @@ _NON_MEDICAL = ("שאינו רפואי", "לא מסמך רפואי", "חשבון
 
 
 class FakeClassifier:
-    """For the tests and offline runs only."""
+    """For the tests and offline runs only. Reports a fixed, deterministic usage under the model
+    name "fake" (no real call is made, so no real count exists; the figures only prove the usage
+    path end to end)."""
+
+    model = "fake"
+    TEXT_USAGE = LLMUsage("classify", model, 900, 0, 40)
+    IMAGE_USAGE = LLMUsage("vision", model, 1200, 0, 40)
 
     def classify(self, text: str) -> Classification:
         if not text.strip():
@@ -172,12 +246,13 @@ class FakeClassifier:
         doc_date = date(int(found.group(3)), int(found.group(2)), int(found.group(1))) if found else None
         identifier = re.search(r"\bP-\d{4,}\b", text)
         patient = identifier.group(0) if identifier else None
+        usage = self.TEXT_USAGE
         if any(word in text for word in _NON_MEDICAL):
-            return Classification(False, None, doc_date, patient)
+            return Classification(False, None, doc_date, patient, usage)
         for word, code in _RULES:
             if word in text:
-                return Classification(True, code, doc_date, patient)
-        return Classification(True, None, doc_date, patient)
+                return Classification(True, code, doc_date, patient, usage)
+        return Classification(True, None, doc_date, patient, usage)
 
     def classify_images(self, images: list[bytes]) -> Classification:
         """There is no OCR here to run a keyword rule against, so this deterministically reads the
@@ -185,4 +260,4 @@ class FakeClassifier:
         an image or a scanned PDF actually reached this method, without pretending to read pixels."""
         if not images:
             raise ClassifierFailed("empty")
-        return Classification(True, "CBC", date(2026, 9, 15), None)
+        return Classification(True, "CBC", date(2026, 9, 15), None, self.IMAGE_USAGE)

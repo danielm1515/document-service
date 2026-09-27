@@ -52,7 +52,8 @@ def test_an_accepted_document_is_stored_and_listed(tmp_path):
     body = response.json()
     assert re.fullmatch(r"DOC-[0-9A-F]{12}", body["document_id"])
     assert body == {"document_id": body["document_id"], "document_type": "CBC",
-                    "document_date": "2026-09-15", "result": "ACCEPTED", "reason": None}
+                    "document_date": "2026-09-15", "result": "ACCEPTED", "reason": None,
+                    "llm_usage": FakeClassifier.TEXT_USAGE.as_json()}
     assert list(store.objects) == [f"patients/P-10041/{body['document_id']}.pdf"]
     assert store.objects[f"patients/P-10041/{body['document_id']}.pdf"] == pdf("2026", "cbc")
     [doc] = listing["documents"]
@@ -572,3 +573,115 @@ def test_the_listing_breaks_a_tied_uploaded_at_by_insertion_order(tmp_path, monk
         docs = client.get("/api/v1/patients/P-10041/documents", headers=H).json()["documents"]
     assert [d["document_id"] for d in docs] == [first_id, second_id]
     assert docs[0]["uploaded_at"] == docs[1]["uploaded_at"]
+
+
+# --- Sub-project 19 (design D5): every 201 answer carries `llm_usage` - the one classify/vision
+# call's tokens, or null when no call was made. The 503 bodies are unchanged. ---
+
+def _openai_classifier(content, usage):
+    from types import SimpleNamespace
+
+    from app.classifier import OpenAIClassifier
+
+    def create(**kwargs):
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+        if usage is not None:
+            response.usage = usage
+        return response
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    return OpenAIClassifier("k", "gpt-5.6-luna", client=client)
+
+
+def _usage(prompt=1234, cached=1000, completion=56):
+    from types import SimpleNamespace
+    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion,
+                           prompt_tokens_details=SimpleNamespace(cached_tokens=cached))
+
+
+CBC_ANSWER = json.dumps({"is_medical": True, "document_type": "CBC", "document_date": "2026-09-15",
+                         "patient_identifier": None})
+
+
+def test_the_201_answers_full_key_set_includes_llm_usage(tmp_path):
+    app, _ = make(tmp_path, classifier=_openai_classifier(CBC_ANSWER, _usage()))
+    with TestClient(app) as client:
+        body = upload(client, "cbc").json()
+    assert body == {"document_id": body["document_id"], "document_type": "CBC", "document_date": "2026-09-15",
+                    "result": "ACCEPTED", "reason": None,
+                    "llm_usage": {"call": "classify", "model": "gpt-5.6-luna", "input_tokens": 1234,
+                                  "cached_input_tokens": 1000, "output_tokens": 56}}
+
+
+def test_a_duplicates_full_key_set_has_a_null_llm_usage(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        upload(client, "cbc")
+        body = upload(client, "cbc").json()
+    assert set(body) == {"document_id", "document_type", "document_date", "result", "reason", "duplicate_of",
+                         "llm_usage"}
+    assert body["result"] == "DUPLICATE_DOCUMENT" and body["llm_usage"] is None
+
+
+def test_an_image_upload_reports_vision_usage(tmp_path):
+    app, _ = make(tmp_path, classifier=_openai_classifier(CBC_ANSWER, _usage(prompt=2000, cached=0, completion=40)))
+    with TestClient(app) as client:
+        body = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                           files={"file": ("scan.png", _pil_image_bytes("PNG"), "image/png")}).json()
+    assert body["result"] == "ACCEPTED"
+    assert body["llm_usage"] == {"call": "vision", "model": "gpt-5.6-luna", "input_tokens": 2000,
+                                 "cached_input_tokens": 0, "output_tokens": 40}
+
+
+def test_the_fake_classifiers_usage_reaches_the_answer(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        text_body = upload(client, "cbc").json()
+        image_body = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                                 files={"file": ("scan.jpg", _pil_image_bytes("JPEG"), "image/jpeg")}).json()
+    assert (text_body["llm_usage"]["call"], text_body["llm_usage"]["model"]) == ("classify", "fake")
+    assert (image_body["llm_usage"]["call"], image_body["llm_usage"]["model"]) == ("vision", "fake")
+
+
+def test_an_early_rejection_has_a_null_llm_usage(tmp_path):
+    app, _ = make(tmp_path)
+    with TestClient(app) as client:
+        body = client.post("/api/v1/patients/P-10041/documents", headers=H,
+                           files={"file": ("x.gif", b"GIF89a not supported", "image/gif")}).json()
+    assert body["reason"] == "not_supported_format"
+    assert "llm_usage" in body and body["llm_usage"] is None
+
+
+def test_an_unparsable_answer_is_unreadable_and_keeps_its_usage(tmp_path):
+    app, _ = make(tmp_path, classifier=_openai_classifier("not json", _usage()))
+    with TestClient(app) as client:
+        response = upload(client, "cbc")
+    body = response.json()
+    assert response.status_code == 201
+    assert body["result"] == "DOCUMENT_UNREADABLE" and body["reason"] == "classifier_unparsable"
+    assert body["llm_usage"] == {"call": "classify", "model": "gpt-5.6-luna", "input_tokens": 1234,
+                                 "cached_input_tokens": 1000, "output_tokens": 56}
+
+
+def test_a_missing_usage_gives_null_counts_with_the_call_and_model(tmp_path):
+    app, _ = make(tmp_path, classifier=_openai_classifier(CBC_ANSWER, None))
+    with TestClient(app) as client:
+        body = upload(client, "cbc").json()
+    assert body["result"] == "ACCEPTED"
+    assert body["llm_usage"] == {"call": "classify", "model": "gpt-5.6-luna", "input_tokens": None,
+                                 "cached_input_tokens": None, "output_tokens": None}
+
+
+def test_the_classifier_unavailable_body_is_unchanged(tmp_path):
+    app, _ = make(tmp_path, classifier=_UnavailableClassifier())
+    with TestClient(app) as client:
+        assert upload(client, "cbc").json() == {"error": "classifier_unavailable"}
+
+
+def test_the_log_line_never_holds_token_counts(tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="document-service")
+    app, _ = make(tmp_path, classifier=_openai_classifier(CBC_ANSWER, _usage(prompt=987654, completion=45678)))
+    with TestClient(app) as client:
+        upload(client, "cbc")
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "document-service")
+    assert logged and "987654" not in logged and "45678" not in logged and "llm_usage" not in logged
